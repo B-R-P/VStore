@@ -1,5 +1,5 @@
-lmdb>=1.6.2
-msgpack>=1.1.1
-fixed-install-nmslib>=2.1.2
-numpy>=2.0.2
-scipy>=1.15.3
+lmdb
+msgpack
+fixed-install-nmslib
+numpy
+scipy
