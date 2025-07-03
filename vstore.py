@@ -4,6 +4,7 @@ import time
 from typing import List, Dict, Any, Optional, Union, Tuple
 import lmdb
 import msgpack
+from msgpack import Packer, Unpacker
 import nmslib
 import numpy as np
 import logging
@@ -42,7 +43,7 @@ class VStore:
         self.query_params = query_params or {'efSearch': 100}
         self.rebuild_threshold = rebuild_threshold
         self.max_map_size = max_map_size
-        self.indexed_metadata_fields = indexed_metadata_fields  # Focused optimization
+        self.indexed_metadata_fields = indexed_metadata_fields
         self.index = nmslib.init(method='hnsw', space=self.space,
                                 data_type=nmslib.DataType.DENSE_VECTOR if vector_type == 'dense' else nmslib.DataType.SPARSE_VECTOR)
         self.index_path = os.path.join(db_path, "index.nms")
@@ -51,7 +52,11 @@ class VStore:
         self.vector_dim = None
         self.logger = logging.getLogger(__name__)
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
-        self.index_lock = threading.Lock()  # Simpler lock for most cases
+        self.index_lock = threading.Lock()
+
+        # Initialize Packer and Unpacker
+        self.packer = Packer(use_bin_type=True, default=self._default)
+        self.unpacker = Unpacker(raw=False, ext_hook=self._ext_hook)
 
         with self.env.begin(write=True) as txn:
             self.db_data = self.env.open_db(b'data', txn=txn)
@@ -61,12 +66,10 @@ class VStore:
             self.db_numeric_metadata = self.env.open_db(b'numeric_metadata', txn=txn)
             self.db_index_counter = self.env.open_db(b'index_counter', txn=txn)
             self.db_deleted_ids = self.env.open_db(b'deleted_ids', txn=txn)
-
             if txn.get(b'total_points', db=self.db_metadata) is None:
                 txn.put(b'total_points', msgpack.packb(0, use_bin_type=True), db=self.db_metadata)
             if txn.get(b'vector_dim', db=self.db_metadata) is None:
                 txn.put(b'vector_dim', msgpack.packb(None, use_bin_type=True), db=self.db_metadata)
-
         self._load_state()
 
     def _default(self, obj):
@@ -117,12 +120,13 @@ class VStore:
                     # Check existing vectors to set dimension
                     with txn.cursor(db=self.db_data) as cursor:
                         for _, value in cursor:
-                            data = msgpack.unpackb(value, raw=False, ext_hook=self._ext_hook, use_list=False)
-                            vector = data['vector']
-                            self.vector_dim = vector.shape[0] if self.vector_type == 'dense' else vector.shape[1]
-                            with self.env.begin(write=True) as txn2:
-                                txn2.put(b'vector_dim', msgpack.packb(self.vector_dim, use_bin_type=True), db=self.db_metadata)
-                            break
+                            self.unpacker.feed(value)
+                            for data in self.unpacker:
+                                vector = data['vector']
+                                self.vector_dim = vector.shape[0] if self.vector_type == 'dense' else vector.shape[1]
+                                with self.env.begin(write=True) as txn2:
+                                    txn2.put(b'vector_dim', self.packer.pack(self.vector_dim), db=self.db_metadata)
+                                break
                 else:
                     self.vector_dim = vector_dim
         except lmdb.Error as e:
@@ -180,7 +184,10 @@ class VStore:
         value = txn.get(key.encode('utf-8'), db=self.db_data)
         if value is None:
             raise KeyError(f"Key '{key}' not found")
-        return msgpack.unpackb(value, raw=False, ext_hook=self._ext_hook, use_list=False)
+        self.unpacker.feed(value)
+        for data in self.unpacker:
+            return data
+        raise ValueError("Failed to unpack data")
 
     def _prepare_vector(self, vector: Union[np.ndarray, csr_matrix]) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         if self.vector_type == 'dense':
@@ -208,12 +215,9 @@ class VStore:
         raise ValueError(f"Unsupported vector_type: {self.vector_type}")
 
     def _update_metadata(self, key: str, metadata: Dict[str, Any], add: bool = True, txn=None):
-        """Optimized metadata update with selective indexing."""
         for meta_key, meta_value in metadata.items():
-            # Skip non-indexed fields if selective indexing is enabled
             if self.indexed_metadata_fields is not None and meta_key not in self.indexed_metadata_fields:
                 continue
-
             if isinstance(meta_value, list):
                 for val in meta_value:
                     composite_key = f"{meta_key}:{val}:{key}".encode('utf-8')
@@ -227,7 +231,6 @@ class VStore:
                     txn.put(composite_key, b'', db=self.db_metadata)
                 else:
                     txn.delete(composite_key, db=self.db_metadata)
-
                 if isinstance(meta_value, (int, float)):
                     padded_value = f"{float(meta_value):020.10f}"
                     numeric_key = f"{meta_key}:{padded_value}:{key}".encode('utf-8')
@@ -322,21 +325,20 @@ class VStore:
                 self.logger.error(f"Failed to resize map_size: {e}. Current size: {info['map_size']}")
                 raise
 
+
     def put(self, vector: Union[np.ndarray, csr_matrix], value: Any,
             metadata: Optional[Dict[str, Any]] = None, key: Optional[str] = None) -> str:
         start_time = time.time()
         try:
-            msgpack.packb(value, use_bin_type=True, default=self._default)
+            self.packer.pack(value)
         except Exception as e:
             raise ValueError(f"Value must be MessagePack-serializable: {e}")
         vector_to_add = self._prepare_vector(vector)
-        # Set vector dimension if not already set
         with self.env.begin(write=True, buffers=True) as txn:
             if self.vector_dim is None:
                 self.vector_dim = vector.shape[0] if self.vector_type == 'dense' else vector.shape[1]
-                txn.put(b'vector_dim', msgpack.packb(self.vector_dim, use_bin_type=True), db=self.db_metadata)
+                txn.put(b'vector_dim', self.packer.pack(self.vector_dim), db=self.db_metadata)
                 self.logger.debug(f"Set vector dimension to {self.vector_dim}")
-
         if key is None:
             max_retries = 5
             for i in range(max_retries):
@@ -347,33 +349,26 @@ class VStore:
                 if i == max_retries - 1:
                     self.logger.warning("Failed to generate unique key after retries")
                     raise ValueError(f"Failed to generate unique key after {max_retries} retries")
-
         with self.env.begin(write=True, buffers=True) as txn:
             self._resize_if_needed(txn)
             if txn.get(key.encode('utf-8'), db=self.db_key_to_index):
                 raise ValueError(f"Key '{key}' already exists. Use update() to modify.")
-
-            idx_data = txn.get(b'next_index', db=self.db_index_counter, default=msgpack.packb(0, use_bin_type=True))
+            idx_data = txn.get(b'next_index', db=self.db_index_counter, default=self.packer.pack(0))
             idx = msgpack.unpackb(idx_data, raw=False)
-            txn.put(b'next_index', msgpack.packb(idx + 1, use_bin_type=True), db=self.db_index_counter)
-
+            txn.put(b'next_index', self.packer.pack(idx + 1), db=self.db_index_counter)
             with self.index_lock:
                 self.index.addDataPoint(idx, vector_to_add)
                 self.index.createIndex(self.hnsw_params, print_progress=True)
                 self.index_initialized = True
-
             data = {'vector': vector, 'value': value, 'metadata': metadata or {}}
-            serialized_data = msgpack.packb(data, use_bin_type=True, default=self._default)
+            serialized_data = self.packer.pack(data)
             txn.put(key.encode('utf-8'), serialized_data, db=self.db_data)
-            txn.put(key.encode('utf-8'), msgpack.packb(idx, use_bin_type=True), db=self.db_key_to_index)
+            txn.put(key.encode('utf-8'), self.packer.pack(idx), db=self.db_key_to_index)
             txn.put(str(idx).encode('utf-8'), key.encode('utf-8'), db=self.db_index_to_key)
-
             if metadata:
                 self._update_metadata(key, metadata, add=True, txn=txn)
-
             total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
-            txn.put(b'total_points', msgpack.packb(total_points + 1, use_bin_type=True), db=self.db_metadata)
-
+            txn.put(b'total_points', self.packer.pack(total_points + 1), db=self.db_metadata)
         self.modifications_since_rebuild += 1
         with self.env.begin(write=True, buffers=True) as txn:
             total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
@@ -389,8 +384,14 @@ class VStore:
         with self.env.begin(write=False, buffers=True) as txn:
             if txn.get(key.encode('utf-8'), db=self.db_deleted_ids):
                 raise KeyError(f"Key '{key}' has been deleted")
-            data = self._get_data(key, txn)
-            return data['vector'], data['value'], data['metadata']
+            value = txn.get(key.encode('utf-8'), db=self.db_data)
+            if value is None:
+                raise KeyError(f"Key '{key}' not found")
+            self.unpacker.feed(value)
+            for data in self.unpacker:
+                return data['vector'], data['value'], data['metadata']
+            raise ValueError("Failed to unpack data")
+    
 
     def delete(self, key: str):
         if key is None:
@@ -402,21 +403,19 @@ class VStore:
                txn.get(key.encode('utf-8'), db=self.db_deleted_ids):
                 self.logger.info(f"Key '{key}' not found or already deleted")
                 return
-
-            data = self._get_data(key, txn)
-            metadata = data['metadata']
-            self._update_metadata(key, metadata, add=False, txn=txn)
-
+            value = txn.get(key.encode('utf-8'), db=self.db_data)
+            self.unpacker.feed(value)
+            for data in self.unpacker:
+                metadata = data['metadata']
+                self._update_metadata(key, metadata, add=False, txn=txn)
             txn.delete(key.encode('utf-8'), db=self.db_data)
             idx = msgpack.unpackb(txn.get(key.encode('utf-8'), db=self.db_key_to_index), raw=False)
             txn.delete(key.encode('utf-8'), db=self.db_key_to_index)
             txn.delete(str(idx).encode('utf-8'), db=self.db_index_to_key)
             txn.put(key.encode('utf-8'), b'', db=self.db_deleted_ids)
-
             total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
             if total_points > 0:
-                txn.put(b'total_points', msgpack.packb(total_points - 1, use_bin_type=True), db=self.db_metadata)
-
+                txn.put(b'total_points', self.packer.pack(total_points - 1), db=self.db_metadata)
         self.modifications_since_rebuild += 1
         with self.env.begin(write=True, buffers=True) as txn:
             total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
@@ -425,40 +424,40 @@ class VStore:
                 self._save_state(txn)
         self.logger.info(f"Delete operation completed in {time.time() - start_time:.2f} seconds")
 
+
     def update(self, key: str, vector: Optional[Union[np.ndarray, csr_matrix]] = None,
-               value: Optional[Any] = None, metadata: Optional[Dict[str, Any]] = None):
+           value: Optional[Any] = None, metadata: Optional[Dict[str, Any]] = None):
         if key is None:
             raise ValueError("Key cannot be None")
         start_time = time.time()
         if value is not None:
             try:
-                msgpack.packb(value, use_bin_type=True, default=self._default)
+                self.packer.pack(value)
             except Exception as e:
                 raise ValueError(f"Value must be MessagePack-serializable: {e}")
         vector_to_add = self._prepare_vector(vector) if vector is not None else None
-
         with self.env.begin(write=True, buffers=True) as txn:
             self._resize_if_needed(txn)
             if txn.get(key.encode('utf-8'), db=self.db_deleted_ids):
                 raise KeyError(f"Key '{key}' has been deleted")
-            data = self._get_data(key, txn)
-            if vector is not None:
-                data['vector'] = vector
-                idx = msgpack.unpackb(txn.get(key.encode('utf-8'), db=self.db_key_to_index), raw=False)
-                with self.index_lock:
-                    self.index.addDataPoint(idx, vector_to_add)
-                    self.index.createIndex(self.hnsw_params, print_progress=True)
-                    self.index_initialized = True
-            if value is not None:
-                data['value'] = value
-            if metadata is not None:
-                self._update_metadata(key, data['metadata'], add=False, txn=txn)
-                data['metadata'] = metadata
-                self._update_metadata(key, metadata, add=True, txn=txn)
-
-            serialized_data = msgpack.packb(data, use_bin_type=True, default=self._default)
-            txn.put(key.encode('utf-8'), serialized_data, db=self.db_data)
-
+            value = txn.get(key.encode('utf-8'), db=self.db_data)
+            self.unpacker.feed(value)
+            for data in self.unpacker:
+                if vector is not None:
+                    data['vector'] = vector
+                    idx = msgpack.unpackb(txn.get(key.encode('utf-8'), db=self.db_key_to_index), raw=False)
+                    with self.index_lock:
+                        self.index.addDataPoint(idx, vector_to_add)
+                        self.index.createIndex(self.hnsw_params, print_progress=True)
+                        self.index_initialized = True
+                if value is not None:
+                    data['value'] = value
+                if metadata is not None:
+                    self._update_metadata(key, data['metadata'], add=False, txn=txn)
+                    data['metadata'] = metadata
+                    self._update_metadata(key, metadata, add=True, txn=txn)
+                serialized_data = self.packer.pack(data)
+                txn.put(key.encode('utf-8'), serialized_data, db=self.db_data)
         self.modifications_since_rebuild += 1
         with self.env.begin(write=True, buffers=True) as txn:
             total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
@@ -466,88 +465,70 @@ class VStore:
                 self._rebuild_index(txn)
                 self._save_state(txn)
         self.logger.info(f"Update operation completed in {time.time() - start_time:.2f} seconds")
+    
 
     def search(self, vector: Union[np.ndarray, csr_matrix], top_k: int = 5,
-               filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Optimized search operation with pre-filtering and early termination."""
+           filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         start_time = time.time()
         vector_to_search = self._prepare_vector(vector)
-
-        # Pre-filtering step
         candidate_keys = None
         candidate_indices = None
-
         if filter:
             with self.env.begin(write=False, buffers=True) as txn:
                 candidate_keys = self._filter_keys(filter, txn)
                 if not candidate_keys:
                     return []
-
-                # Convert candidate keys to index IDs for more efficient filtering
                 candidate_indices = set()
                 for key in candidate_keys:
                     idx_data = txn.get(key.encode('utf-8'), db=self.db_key_to_index)
                     if idx_data:
                         idx = msgpack.unpackb(idx_data, raw=False)
                         candidate_indices.add(idx)
-
-        # Get total points to determine query size
         with self.env.begin(write=False, buffers=True) as txn:
             total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
             if total_points == 0 or not self.index_initialized:
                 return []
-
-        # Perform search with read lock
         with self.index_lock:
             candidates = []
             query_k = min(top_k * 10, total_points)
             max_candidates = top_k * 100
             found_enough = False
-
             while len(candidates) < top_k and query_k <= max_candidates and not found_enough:
                 try:
                     ids, distances = self.index.knnQuery(vector_to_search, k=query_k)
                 except Exception as e:
                     self.logger.error(f"Search failed: {e}")
                     return []
-
-                # Process results in a single transaction
                 with self.env.begin(write=False, buffers=True) as txn:
                     for idx, dist in zip(ids, distances):
                         if candidate_indices is not None and idx not in candidate_indices:
                             continue
-
                         key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
                         if key is None:
                             continue
                         key_str = key.tobytes().decode('utf-8')
-
                         if candidate_keys is not None and key_str not in candidate_keys:
                             continue
-
-                        data = self._get_data(key_str, txn)
-                        candidates.append({
-                            'key': key_str,
-                            'value': data['value'],
-                            'metadata': data['metadata'],
-                            'score': float(1 - dist)
-                        })
-
-                        # Early exit if we have enough candidates
-                        if len(candidates) >= top_k:
-                            found_enough = True
-                            break
-
-                if not found_enough:
-                    query_k = min(query_k * 2, max_candidates)
-
-            # Sort by score if we have more candidates than needed
+                        value = txn.get(key_str.encode('utf-8'), db=self.db_data)
+                        self.unpacker.feed(value)
+                        for data in self.unpacker:
+                            candidates.append({
+                                'key': key_str,
+                                'value': data['value'],
+                                'metadata': data['metadata'],
+                                'score': float(1 - dist)
+                            })
+                            if len(candidates) >= top_k:
+                                found_enough = True
+                                break
+                    if not found_enough:
+                        query_k = min(query_k * 2, max_candidates)
             if len(candidates) > top_k:
                 candidates.sort(key=lambda x: x['score'], reverse=True)
                 candidates = candidates[:top_k]
-
         self.logger.info(f"Search operation completed in {time.time() - start_time:.2f} seconds with {len(candidates)} results")
         return candidates
+
 
     def batch_put(self, list_of_entries: List[Dict[str, Any]]) -> List[str]:
         start_time = time.time()
