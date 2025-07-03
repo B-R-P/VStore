@@ -184,10 +184,10 @@ class VStore:
         value = txn.get(key.encode('utf-8'), db=self.db_data)
         if value is None:
             raise KeyError(f"Key '{key}' not found")
-        self.unpacker.feed(value)
-        for data in self.unpacker:
-            return data
-        raise ValueError("Failed to unpack data")
+        try:
+            return msgpack.unpackb(value, raw=False, ext_hook=self._ext_hook)
+        except Exception as e:
+            raise ValueError(f"Failed to unpack data: {e}")
 
     def _prepare_vector(self, vector: Union[np.ndarray, csr_matrix]) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         if self.vector_type == 'dense':
@@ -387,10 +387,11 @@ class VStore:
             value = txn.get(key.encode('utf-8'), db=self.db_data)
             if value is None:
                 raise KeyError(f"Key '{key}' not found")
-            self.unpacker.feed(value)
-            for data in self.unpacker:
+            try:
+                data = msgpack.unpackb(value, raw=False, ext_hook=self._ext_hook)
                 return data['vector'], data['value'], data['metadata']
-            raise ValueError("Failed to unpack data")
+            except Exception as e:
+                raise ValueError(f"Failed to unpack data: {e}")
     
 
     def delete(self, key: str):
