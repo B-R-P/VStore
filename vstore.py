@@ -610,7 +610,7 @@ class VStore:
                 if key is None:
                     raise ValueError("Key cannot be None")
                 if txn.get(key.encode('utf-8'), db=self.db_deleted_ids):
-                    raise Nelle Keys: raise KeyError(f"Key '{key}' has been deleted")
+                    raise KeyError(f"Key '{key}' has been deleted")
                 data = self._get_data(key, txn)
                 results.append((data['vector'], data['value'], data['metadata']))
             return results
