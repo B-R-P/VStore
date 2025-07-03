@@ -42,15 +42,25 @@ class VStore:
         self.query_params = query_params or {'efSearch': 100}
         self.rebuild_threshold = rebuild_threshold
         self.max_map_size = max_map_size
+
+        # Initialize the index properly
         self.index = nmslib.init(method='hnsw', space=self.space,
                                 data_type=nmslib.DataType.DENSE_VECTOR if vector_type == 'dense' else nmslib.DataType.SPARSE_VECTOR)
+        # Create an empty index immediately
+        try:
+            self.index.createIndex(self.hnsw_params, print_progress=True)
+            self.index_initialized = True
+        except Exception as e:
+            self.logger = logging.getLogger(__name__)
+            self.logger.warning(f"Could not create empty index during initialization: {e}")
+            self.index_initialized = False
+
         self.index_path = os.path.join(db_path, "index.nms")
         self.modifications_since_rebuild = 0
-        self.index_initialized = False
-        self.vector_dim = None
         self.logger = logging.getLogger(__name__)
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
         self.index_lock = threading.Lock()
+        self.vector_dim = None
 
         # Initialize databases
         with self.env.begin(write=True) as txn:
@@ -123,6 +133,9 @@ class VStore:
                     cursor = txn.cursor(db=self.db_data)
                     found_vector = False
                     for key, value in cursor:
+                        # Convert memoryview to bytes if needed
+                        if isinstance(key, memoryview):
+                            key = key.tobytes()
                         if not key.startswith(b'deleted:'):
                             try:
                                 data = msgpack.unpackb(value, raw=False, ext_hook=self._ext_hook, use_list=False)
@@ -138,12 +151,11 @@ class VStore:
                                 continue
                     if not found_vector:
                         self.logger.debug("No valid vectors found in the database to determine dimension")
-                        self.vector_dim = None  # Dimension will be set when first vector is inserted
+                        self.vector_dim = None
                 else:
                     self.vector_dim = vector_dim
 
             # Only attempt to rebuild index if we have vectors
-            # Otherwise, we'll initialize an empty index which is fine
             if not self.index_initialized:
                 with self.index_lock:
                     vectors = []
@@ -156,6 +168,9 @@ class VStore:
                         cursor = txn.cursor(db=self.db_index_mapping)
                         cursor.set_range(b'key:')
                         for key, value in cursor:
+                            # Ensure key is bytes
+                            if isinstance(key, memoryview):
+                                key = key.tobytes()
                             if key.startswith(b'key:'):
                                 doc_key = key[4:].decode('utf-8')
                                 idx = msgpack.unpackb(value, raw=False)
@@ -166,6 +181,9 @@ class VStore:
                         cursor = txn.cursor(db=self.db_data)
                         cursor.set_range(b'deleted:')
                         for key, _ in cursor:
+                            # Ensure key is bytes
+                            if isinstance(key, memoryview):
+                                key = key.tobytes()
                             if key.startswith(b'deleted:'):
                                 doc_key = key[8:].decode('utf-8')
                                 deleted_keys.add(doc_key)
@@ -212,7 +230,6 @@ class VStore:
             raise
         except Exception as e:
             self.logger.error(f"Failed to load index: {e}. Will attempt to rebuild.")
-            # If we fail to load the index, try to rebuild it
             try:
                 with self.env.begin(write=True, buffers=True) as txn:
                     self._rebuild_index(txn)
@@ -220,7 +237,6 @@ class VStore:
             except Exception as rebuild_error:
                 self.logger.error(f"Failed to rebuild index: {rebuild_error}")
                 raise
-
 
     def _prepare_vector(self, vector: Union[np.ndarray, csr_matrix]) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """Prepare a vector for insertion into the index."""
@@ -250,7 +266,6 @@ class VStore:
 
     def _update_metadata_indexes(self, key: str, metadata: Dict[str, Any], add: bool = True, txn=None):
         """Update the metadata indexes for a given key."""
-        close_txn = False
         if txn is None:
             with self.env.begin(write=True) as txn:
                 self._update_metadata_indexes(key, metadata, add, txn)
@@ -386,16 +401,22 @@ class VStore:
         cursor = txn.cursor(db=self.db_index_mapping)
         cursor.set_range(b'key:')
         for key, value in cursor:
+            # Ensure key is bytes
+            if isinstance(key, memoryview):
+                key = key.tobytes()
             if key.startswith(b'key:'):
                 doc_key = key[4:].decode('utf-8')
                 idx = msgpack.unpackb(value, raw=False)
                 key_to_idx[doc_key] = idx
 
-        # Second pass: collect all deleted keys
+        # Check which keys are deleted
         deleted_keys = set()
         cursor = txn.cursor(db=self.db_data)
         cursor.set_range(b'deleted:')
         for key, _ in cursor:
+            # Ensure key is bytes
+            if isinstance(key, memoryview):
+                key = key.tobytes()
             if key.startswith(b'deleted:'):
                 doc_key = key[8:].decode('utf-8')
                 deleted_keys.add(doc_key)
@@ -403,7 +424,6 @@ class VStore:
         # Third pass: collect all valid vectors
         for doc_key, idx in key_to_idx.items():
             if doc_key not in deleted_keys:
-                # Get the data
                 data_value = txn.get(doc_key.encode('utf-8'), db=self.db_data)
                 if data_value:
                     try:
@@ -414,6 +434,7 @@ class VStore:
                         indices.append(idx)
                     except Exception as e:
                         self.logger.error(f"Error processing vector for key {doc_key}: {e}")
+                        continue
 
         # Add vectors to index
         if vectors:
@@ -423,7 +444,17 @@ class VStore:
                 self.index.setQueryTimeParams(self.query_params)
                 self.index_initialized = True
         else:
-            self.index_initialized = False
+            # Create an empty index if no vectors exist
+            with self.index_lock:
+                if hasattr(self.index, 'createIndex'):
+                    try:
+                        self.index.createIndex(self.hnsw_params, print_progress=True)
+                        self.index_initialized = True
+                    except Exception as e:
+                        self.logger.error(f"Error creating empty index: {e}")
+                        self.index_initialized = False
+                else:
+                    self.index_initialized = True
 
         self.modifications_since_rebuild = 0
         self.logger.info(f"Index rebuild completed in {time.time() - start_time:.2f} seconds with {len(vectors)} vectors")
@@ -433,6 +464,15 @@ class VStore:
         if not self.index_initialized:
             self.logger.debug("Skipping index save: index is not initialized")
             return
+
+        # Ensure the index has been created before saving
+        if not self.index_initialized:
+            with self.index_lock:
+                if hasattr(self.index, 'createIndex') and not hasattr(self.index, 'indexSize'):
+                    # Try to create an empty index if none exists
+                    self.index.createIndex(self.hnsw_params, print_progress=True)
+                    self.index_initialized = True
+
         try:
             with self.index_lock:
                 self.index.saveIndex(self.index_path, save_data=True)
@@ -707,6 +747,10 @@ class VStore:
         start_time = time.time()
         vector_to_search = self._prepare_vector(vector)
 
+        # Ensure index is initialized
+        if not self.index_initialized:
+            self._load_state()
+
         # Pre-filter keys if filter is provided
         candidate_keys = set()
         if filter:
@@ -718,69 +762,109 @@ class VStore:
         with self.index_lock:
             if not self.index_initialized:
                 self._load_state()
+
+            # Ensure index has been created
+            if not hasattr(self.index, 'indexSize'):
+                try:
+                    self.index.createIndex(self.hnsw_params, print_progress=True)
+                    self.index_initialized = True
+                except Exception as e:
+                    self.logger.error(f"Failed to create index during search: {e}")
+                    return []
+
             try:
                 # Get more candidates than needed to account for filtering
                 query_k = min(top_k * 20, 1000)  # Limit to 1000 for performance
-                ids, distances = self.index.knnQuery(vector_to_search, k=query_k)
+                if hasattr(self.index, 'knnQuery'):
+                    ids, distances = self.index.knnQuery(vector_to_search, k=query_k)
+                else:
+                    # Handle case where index isn't properly initialized
+                    self.logger.error("Index is not properly initialized for search")
+                    return []
             except Exception as e:
                 self.logger.error(f"Search failed: {e}")
                 return []
 
+        # If we have no results but the index was created, it might be empty
+        if not ids:
+            self.logger.debug("No search results returned - index might be empty")
+            return []
+
         # Collect candidate keys from index results
         candidate_indices = set(ids)
         candidate_index_to_key = {}
+        key_to_data = {}
+
         with self.env.begin(write=False) as txn:
             # Get keys for all candidate indices
             for idx in candidate_indices:
                 key = txn.get(f"index:{idx}".encode('utf-8'), db=self.db_index_mapping)
-                if key:
-                    candidate_index_to_key[idx] = key.decode('utf-8')
+                if key and isinstance(key, (memoryview, bytes)):
+                    # Ensure key is properly decoded
+                    key_str = key.tobytes().decode('utf-8') if isinstance(key, memoryview) else key.decode('utf-8')
+                    candidate_index_to_key[idx] = key_str
 
             # Now collect data for all valid candidates
-            results = []
-            candidate_count = 0
-            for idx, dist in zip(ids, distances):
-                key_str = candidate_index_to_key.get(idx)
-                if key_str is None:
-                    continue
-
-                # Check filter if provided
-                if candidate_keys is not None and key_str not in candidate_keys:
+            for idx, key_str in candidate_index_to_key.items():
+                if candidate_keys and key_str not in candidate_keys:
                     continue
 
                 try:
-                    data = self._get_data(key_str, txn, fields=['vector', 'value', 'metadata'])
-
-                    # Determine score based on distance metric
-                    if self.space in ['cosinesimil']:
-                        score = float(1 - dist)
-                    elif self.space in ['l2']:
-                        score = float(-dist)  # Using negative distance as similarity score
-                    elif self.space in ['ip']:
-                        score = float(dist)  # Inner product is already a similarity score
-                    else:
-                        score = float(1 - dist)  # Default behavior
-
-                    results.append({
-                        'key': key_str,
+                    data = self._get_data(key_str, txn)
+                    key_to_data[key_str] = {
+                        'vector': data['vector'],
                         'value': data['value'],
                         'metadata': data['metadata'],
-                        'score': score
-                    })
-                    candidate_count += 1
-
-                    if len(results) >= top_k:
-                        break
+                        'index': idx
+                    }
                 except Exception as e:
-                    self.logger.error(f"Error processing candidate {key_str}: {e}")
+                    self.logger.error(f"Error retrieving data for key {key_str}: {e}")
                     continue
 
-            # Sort results by score in descending order (assuming higher score is better)
-            results.sort(key=lambda x: x['score'], reverse=True)
-            results = results[:top_k]  # Ensure we don't return more than asked for
+        # Process the results
+        results = []
+        for idx, dist in zip(ids, distances):
+            key_str = candidate_index_to_key.get(idx)
+            if key_str is None:
+                continue
 
-        self.logger.info(f"Search operation completed in {time.time() - start_time:.2f} seconds with {len(results)} results")
-        return results
+            data = key_to_data.get(key_str)
+            if data is None:
+                continue
+
+            # Check filter if provided
+            if candidate_keys is not None and key_str not in candidate_keys:
+                continue
+
+            # Determine score based on distance metric
+            if self.space in ['cosinesimil']:
+                score = float(1 - dist)
+            elif self.space in ['l2']:
+                score = float(-dist)  # Using negative distance as similarity score
+            elif self.space in ['ip']:
+                score = float(dist)  # Inner product is already a similarity score
+            else:
+                score = float(1 - dist)  # Default behavior
+
+            results.append({
+                'key': key_str,
+                'value': data['value'],
+                'metadata': data['metadata'],
+                'score': score
+            })
+
+            if len(results) >= top_k:
+                break
+
+        # If we didn't get enough results, try to return whatever we have
+        if len(results) < top_k and len(results) > 0:
+            self.logger.debug(f"Only found {len(results)} results when {top_k} were requested")
+
+        # Sort results by score in descending order
+        results.sort(key=lambda x: x['score'], reverse=True)
+
+        # Return only the requested number of results
+        return results[:top_k]
 
     def batch_put(self, list_of_entries: List[Dict[str, Any]]) -> List[str]:
         """Add multiple entries to the store in a batch operation."""
@@ -879,247 +963,124 @@ class VStore:
         self.logger.info(f"Batch put operation completed in {time.time() - start_time:.2f} seconds")
         return keys
 
-    def batch_search(self, list_of_vectors: List[Union[np.ndarray, csr_matrix]], top_k: int = 5,
-                     filter: Optional[Dict[str, Any]] = None) -> List[List[Dict[str, Any]]]:
-        """Perform a batch search for the nearest neighbors of multiple vectors."""
-        start_time = time.time()
-        list_of_vectors_to_search = [self._prepare_vector(v) for v in list_of_vectors]
-
-        # Pre-filter keys if filter is provided
-        candidate_keys = set()
-        if filter:
-            with self.env.begin(write=False) as txn:
-                candidate_keys = self._filter_keys(filter, txn)
-                self.logger.debug(f"Filter returned {len(candidate_keys)} candidate keys")
-
-        # Batch query the index
-        with self.index_lock:
-            if not self.index_initialized:
-                self._load_state()
-            try:
-                # Limit the number of candidates to retrieve
-                query_k = min(top_k * 20, 1000)  # Limit to 1000 for performance
-                ids_dists_list = self.index.knnQueryBatch(list_of_vectors_to_search, k=query_k, num_threads=cpu_count())
-            except Exception as e:
-                self.logger.error(f"Batch search failed: {e}")
-                return [[] for _ in list_of_vectors]
-
-        # Collect all unique candidate indices from all queries
-        all_candidate_indices = set()
-        for ids, _ in ids_dists_list:
-            all_candidate_indices.update(ids)
-
-        # Retrieve keys and data for all candidate indices in a single transaction
-        key_to_data = {}
-        with self.env.begin(write=False) as txn:
-            # Create a mapping from index to key for all candidate indices
-            candidate_index_to_key = {}
-            for idx in all_candidate_indices:
-                key = txn.get(f"index:{idx}".encode('utf-8'), db=self.db_index_mapping)
-                if key:
-                    candidate_index_to_key[idx] = key.decode('utf-8')
-
-            # For each candidate key, retrieve its data if it passes the filter
-            for idx, key_str in candidate_index_to_key.items():
-                if candidate_keys is None or key_str in candidate_keys:
-                    try:
-                        data = self._get_data(key_str, txn, fields=['vector', 'value', 'metadata'])
-                        key_to_data[key_str] = {
-                            'vector': data['vector'],
-                            'value': data['value'],
-                            'metadata': data['metadata'],
-                            'index': idx
-                        }
-                    except Exception as e:
-                        self.logger.error(f"Error retrieving data for key {key_str}: {e}")
-
-        # Process results for each query
+    def batch_get(self, list_of_keys: List[str]) -> List[Tuple[Union[np.ndarray, csr_matrix], Any, Dict[str, Any]]]:
+        """Retrieve multiple vectors, values, and metadata by their keys."""
         results = []
-        for query_idx, (ids, distances) in enumerate(ids_dists_list):
-            query_results = []
-            for idx, dist in zip(ids, distances):
-                key_str = candidate_index_to_key.get(idx)
-                if key_str is None:
-                    continue
-
-                # Check if we have data for this key (should always be true)
-                if key_str in key_to_data:
-                    data = key_to_data[key_str]
-
-                    # Determine score based on distance metric
-                    if self.space in ['cosinesimil']:
-                        score = float(1 - dist)
-                    elif self.space in ['l2']:
-                        score = float(-dist)  # Using negative distance as similarity score
-                    elif self.space in ['ip']:
-                        score = float(dist)  # Inner product is already a similarity score
-                    else:
-                        score = float(1 - dist)  # Default behavior
-
-                    query_results.append({
-                        'key': key_str,
-                        'value': data['value'],
-                        'metadata': data['metadata'],
-                        'score': score
-                    })
-                    if len(query_results) >= top_k:
-                        break
-
-            # Sort results by score and limit to top_k
-            query_results.sort(key=lambda x: x['score'], reverse=True)
-            results.append(query_results[:top_k])
-
-        self.logger.info(f"Batch search operation completed in {time.time() - start_time:.2f} seconds")
+        with self.env.begin(write=False, buffers=True) as txn:
+            for key in list_of_keys:
+                try:
+                    data = self._get_data(key, txn)
+                    results.append((data['vector'], data['value'], data['metadata']))
+                except KeyError:
+                    results.append((None, None, None))
         return results
 
-    def compact_database(self):
-        """Compact the database by physically removing deleted documents and reclaiming space."""
-        start_time = time.time()
-        self.logger.info("Starting database compaction")
+    def get_by_metadata(self, filter: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Get entries by metadata filter."""
+        results = []
+        with self.env.begin(write=False) as txn:
+            matched_keys = self._filter_keys(filter, txn)
 
-        # Create a temporary environment for the compacted database
-        temp_dir = os.path.join(self.db_path, 'temp_compact')
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_env = lmdb.open(temp_dir, map_size=self.env.info()['map_size'], max_dbs=4, writemap=True)
+            for key_str in matched_keys:
+                try:
+                    data = self._get_data(key_str, txn)
+                    results.append({
+                        'key': key_str,
+                        'vector': data['vector'],
+                        'value': data['value'],
+                        'metadata': data['metadata']
+                    })
+                except KeyError:
+                    continue
 
-        # Perform compaction
-        with self.env.begin(write=False) as read_txn, temp_env.begin(write=True) as write_txn:
-            # Create databases in the temporary environment
-            temp_db_data = temp_env.open_db(b'data', txn=write_txn)
-            temp_db_index_mapping = temp_env.open_db(b'index_mapping', txn=write_txn)
-            temp_db_metadata_index = temp_env.open_db(b'metadata_index', txn=write_txn)
-            temp_db_system_metadata = temp_env.open_db(b'system_metadata', txn=write_txn)
+        return results
 
-            # Copy system metadata (we'll update total_points and next_index later)
-            cursor = read_txn.cursor(db=self.db_system_metadata)
-            for key, value in cursor:
-                # Skip total_points and next_index as we'll update them
-                if key not in [b'total_points', b'next_index']:
-                    write_txn.put(key, value, db=temp_db_system_metadata)
+    def clear(self):
+        """Clear all data from the store."""
+        with self.env.begin(write=True, buffers=True) as txn:
+            # Clear all data databases
+            for db_name in ['data', 'index_mapping', 'metadata_index', 'system_metadata']:
+                db = getattr(self, f'db_{db_name}')
+                cursor = txn.cursor(db=db)
+                for key, _ in cursor:
+                    txn.delete(key, db=db)
 
-            # Collect all non-deleted documents and prepare new indices
-            deleted_keys = set()
-            cursor = read_txn.cursor(db=self.db_data)
-            cursor.set_range(b'deleted:')
-            for key, _ in cursor:
-                if key.startswith(b'deleted:'):
-                    deleted_keys.add(key[8:].decode('utf-8'))
+            # Reset system metadata
+            txn.put(b'total_points', msgpack.packb(0, use_bin_type=True), db=self.db_system_metadata)
+            txn.put(b'next_index', msgpack.packb(0, use_bin_type=True), db=self.db_system_metadata)
 
-            # Process all non-deleted data
-            new_index = 0
-            key_to_new_index = {}
-            index_to_key = {}
+        # Reset the index
+        with self.index_lock:
+            self.index = nmslib.init(method='hnsw', space=self.space,
+                                    data_type=nmslib.DataType.DENSE_VECTOR if self.vector_type == 'dense' else nmslib.DataType.SPARSE_VECTOR)
+            self.index_initialized = False
 
-            # First pass: copy non-deleted data and assign new indices
-            cursor = read_txn.cursor(db=self.db_data)
-            for key, value in cursor:
-                doc_key = key.decode('utf-8')
-                if not key.startswith(b'deleted:') and doc_key not in deleted_keys:
-                    # Get the old index (not strictly needed for compaction but useful for debugging)
-                    old_idx_data = read_txn.get(f"key:{doc_key}".encode('utf-8'), db=self.db_index_mapping)
-                    if old_idx_data:
-                        # Assign a new sequential index
-                        key_to_new_index[doc_key] = new_index
-                        index_to_key[new_index] = doc_key
-                        new_index += 1
+        self.modifications_since_rebuild = 0
+        self.logger.info("Cleared all data from the store")
 
-                    # Copy the data to the new database
-                    write_txn.put(doc_key.encode('utf-8'), value, db=temp_db_data)
-
-            # Update system metadata with new count and next index
-            new_total = len(key_to_new_index)
-            write_txn.put(b'total_points', msgpack.packb(new_total, use_bin_type=True), db=temp_db_system_metadata)
-            write_txn.put(b'next_index', msgpack.packb(new_total, use_bin_type=True), db=temp_db_system_metadata)
-
-            # Second pass: rebuild index mappings and metadata indexes
-            for doc_key, new_idx in key_to_new_index.items():
-                # Get original data to extract metadata
-                data_value = read_txn.get(doc_key.encode('utf-8'), db=self.db_data)
-                if data_value:
-                    try:
-                        data = msgpack.unpackb(data_value, raw=False, ext_hook=self._ext_hook, use_list=False)
-                        metadata = data.get('metadata', {})
-
-                        # Store new index mappings
-                        write_txn.put(f"key:{doc_key}".encode('utf-8'), msgpack.packb(new_idx, use_bin_type=True), db=temp_db_index_mapping)
-                        write_txn.put(f"index:{new_idx}".encode('utf-8'), doc_key.encode('utf-8'), db=temp_db_index_mapping)
-
-                        # Rebuild metadata indexes
-                        if metadata:
-                            for meta_key, meta_value in metadata.items():
-                                if isinstance(meta_value, list):
-                                    for val in meta_value:
-                                        composite_key = f"meta:{meta_key}:{val}:{doc_key}".encode('utf-8')
-                                        write_txn.put(composite_key, b'', db=temp_db_metadata_index)
-                                else:
-                                    composite_key = f"meta:{meta_key}:{meta_value}:{doc_key}".encode('utf-8')
-                                    write_txn.put(composite_key, b'', db=temp_db_metadata_index)
-
-                                    if isinstance(meta_value, (int, float)):
-                                        padded_value = f"{float(meta_value):020.10f}"
-                                        numeric_key = f"meta:{meta_key}:{padded_value}:{doc_key}".encode('utf-8')
-                                        write_txn.put(numeric_key, b'', db=temp_db_metadata_index)
-                    except Exception as e:
-                        self.logger.error(f"Error processing metadata for key {doc_key}: {e}")
-                        continue
-
-        # Sync and close the temporary environment
-        temp_env.sync()
-        temp_env.close()
-
-        # Close the original environment
-        self.env.close()
-
-        # Replace the original directory with the compacted one
-        # Note: In production, you'd want to ensure atomicity of this operation
-        # Here we use a simple approach for demonstration
-        import shutil
-
-        # Backup original database (optional)
-        backup_path = os.path.join(self.db_path, 'backup_' + time.strftime("%Y%m%d_%H%M%S"))
-        if os.path.exists(self.db_path):
-            try:
-                shutil.move(self.db_path, backup_path)
-            except Exception as e:
-                self.logger.error(f"Failed to create backup: {e}")
-
-        # Move temp directory to original location
-        try:
-            shutil.move(temp_dir, self.db_path)
-        except Exception as e:
-            self.logger.error(f"Failed to replace database with compacted version: {e}")
-            # Try to restore from backup if it exists
-            if os.path.exists(backup_path):
-                shutil.move(backup_path, self.db_path)
-            raise RuntimeError(f"Compaction failed: {e}")
-
-        # Reopen the environment with the compacted database
-        self.env = lmdb.open(self.db_path, map_size=self.max_map_size, max_dbs=4, writemap=True)
-        with self.env.begin(write=True) as txn:
-            self.db_data = self.env.open_db(b'data', txn=txn)
-            self.db_index_mapping = self.env.open_db(b'index_mapping', txn=txn)
-            self.db_metadata_index = self.env.open_db(b'metadata_index', txn=txn)
-            self.db_system_metadata = self.env.open_db(b'system_metadata', txn=txn)
-
-        # Rebuild the index from the compacted data
-        with self.env.begin(write=True) as txn:
+    def compact_index(self):
+        """Compact the index by rebuilding it."""
+        with self.env.begin(write=True, buffers=True) as txn:
             self._rebuild_index(txn)
             self._save_state(txn)
+        self.logger.info("Compacted the index")
 
-        self.logger.info(f"Database compaction completed in {time.time() - start_time:.2f} seconds")
+    def validate_indices(self):
+        """Validate the indices in the database."""
+        with self.env.begin(write=False) as txn:
+            # Get all keys and indices
+            key_to_idx = {}
+            cursor = txn.cursor(db=self.db_index_mapping)
+            cursor.set_range(b'key:')
+            for key, value in cursor:
+                if key.startswith(b'key:'):
+                    doc_key = key[4:].decode('utf-8')
+                    idx = msgpack.unpackb(value, raw=False)
+                    key_to_idx[doc_key] = idx
+
+            # Get all keys from data store
+            data_keys = set()
+            cursor = txn.cursor(db=self.db_data)
+            for key, _ in cursor:
+                if not key.startswith(b'deleted:'):
+                    data_keys.add(key.decode('utf-8'))
+
+            # Check if all data keys have corresponding index mappings
+            missing_indices = []
+            for key in data_keys:
+                if key not in key_to_idx:
+                    missing_indices.append(key)
+
+            # Check if all index mappings have corresponding data
+            missing_data = []
+            for key in key_to_idx.keys():
+                if key not in data_keys:
+                    # Check if key is marked as deleted
+                    if not txn.get(f"deleted:{key}".encode('utf-8'), db=self.db_data):
+                        missing_data.append(key)
+
+            if missing_indices or missing_data:
+                raise ValueError(f"Index validation failed. Missing indices for keys: {missing_indices}. Missing data for keys: {missing_data}")
+
+            self.logger.info("Index validation successful")
 
     def close(self):
         """Close the vector store resources."""
-        # Save state before closing
-        with self.env.begin(write=True, buffers=True) as txn:
-            self._save_state(txn)
+        try:
+            # Save index state before closing
+            if hasattr(self, 'index') and hasattr(self.index, 'saveIndex'):
+                try:
+                    with self.index_lock:
+                        if self.index_initialized:
+                            self.index.saveIndex(self.index_path, save_data=True)
+                except Exception as e:
+                    self.logger.error(f"Failed to save index: {e}")
 
-        self.env.close()
-        self.thread_pool.shutdown(wait=True)
-        self.logger.info("Closed VectorStore resources")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+            if hasattr(self, 'env') and self.env:
+                self.env.close()
+            if hasattr(self, 'thread_pool') and self.thread_pool:
+                self.thread_pool.shutdown(wait=True)
+            self.logger.info("Closed VectorStore resources")
+        except Exception as e:
+            self.logger.error(f"Error during close: {e}")
+            raise
