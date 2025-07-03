@@ -185,9 +185,13 @@ class VStore:
         if value is None:
             raise KeyError(f"Key '{key}' not found")
         try:
-            return msgpack.unpackb(value, raw=False, ext_hook=self._ext_hook)
+            unpacker = Unpacker(raw=False, ext_hook=self._ext_hook)
+            unpacker.feed(value)
+            for data in unpacker:
+                return data
         except Exception as e:
             raise ValueError(f"Failed to unpack data: {e}")
+
 
     def _prepare_vector(self, vector: Union[np.ndarray, csr_matrix]) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         if self.vector_type == 'dense':
@@ -388,10 +392,14 @@ class VStore:
             if value is None:
                 raise KeyError(f"Key '{key}' not found")
             try:
-                data = msgpack.unpackb(value, raw=False, ext_hook=self._ext_hook)
-                return data['vector'], data['value'], data['metadata']
+                # Create a new unpacker for this operation
+                unpacker = Unpacker(raw=False, ext_hook=self._ext_hook)
+                unpacker.feed(value)
+                for data in unpacker:
+                    return data['vector'], data['value'], data.get('metadata', {})
             except Exception as e:
                 raise ValueError(f"Failed to unpack data: {e}")
+
     
 
     def delete(self, key: str):
@@ -511,17 +519,19 @@ class VStore:
                         if candidate_keys is not None and key_str not in candidate_keys:
                             continue
                         value = txn.get(key_str.encode('utf-8'), db=self.db_data)
-                        self.unpacker.feed(value)
-                        for data in self.unpacker:
-                            candidates.append({
-                                'key': key_str,
-                                'value': data['value'],
-                                'metadata': data['metadata'],
-                                'score': float(1 - dist)
-                            })
-                            if len(candidates) >= top_k:
-                                found_enough = True
-                                break
+                        if value:
+                            unpacker = Unpacker(raw=False, ext_hook=self._ext_hook)
+                            unpacker.feed(value)
+                            for data in unpacker:
+                                candidates.append({
+                                    'key': key_str,
+                                    'value': data['value'],
+                                    'metadata': data['metadata'],
+                                    'score': float(1 - dist)
+                                })
+                                if len(candidates) >= top_k:
+                                    found_enough = True
+                                    break
                     if not found_enough:
                         query_k = min(query_k * 2, max_candidates)
             if len(candidates) > top_k:
@@ -529,6 +539,7 @@ class VStore:
                 candidates = candidates[:top_k]
         self.logger.info(f"Search operation completed in {time.time() - start_time:.2f} seconds with {len(candidates)} results")
         return candidates
+
 
 
     def batch_put(self, list_of_entries: List[Dict[str, Any]]) -> List[str]:
