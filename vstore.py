@@ -41,15 +41,16 @@ class VStore:
         self.query_params = query_params or {'efSearch': 100}
         self.rebuild_threshold = rebuild_threshold
         self.max_map_size = max_map_size
+        self.indexed_metadata_fields = indexed_metadata_fields  # Focused optimization
         self.index = nmslib.init(method='hnsw', space=self.space,
-                                 data_type=nmslib.DataType.DENSE_VECTOR if vector_type == 'dense' else nmslib.DataType.SPARSE_VECTOR)
+                                data_type=nmslib.DataType.DENSE_VECTOR if vector_type == 'dense' else nmslib.DataType.SPARSE_VECTOR)
         self.index_path = os.path.join(db_path, "index.nms")
         self.modifications_since_rebuild = 0
         self.index_initialized = False
-        self.vector_dim = None  # To store expected vector dimensionality
+        self.vector_dim = None
         self.logger = logging.getLogger(__name__)
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
-        self.index_lock = threading.Lock()
+        self.index_lock = threading.Lock()  # Simpler lock for most cases
 
         with self.env.begin(write=True) as txn:
             self.db_data = self.env.open_db(b'data', txn=txn)
@@ -59,6 +60,7 @@ class VStore:
             self.db_numeric_metadata = self.env.open_db(b'numeric_metadata', txn=txn)
             self.db_index_counter = self.env.open_db(b'index_counter', txn=txn)
             self.db_deleted_ids = self.env.open_db(b'deleted_ids', txn=txn)
+
             if txn.get(b'total_points', db=self.db_metadata) is None:
                 txn.put(b'total_points', msgpack.packb(0, use_bin_type=True), db=self.db_metadata)
             if txn.get(b'vector_dim', db=self.db_metadata) is None:
@@ -205,12 +207,17 @@ class VStore:
         raise ValueError(f"Unsupported vector_type: {self.vector_type}")
 
     def _update_metadata(self, key: str, metadata: Dict[str, Any], add: bool = True, txn=None):
+        """Optimized metadata update with selective indexing."""
         for meta_key, meta_value in metadata.items():
+            # Skip non-indexed fields if selective indexing is enabled
+            if self.indexed_metadata_fields is not None and meta_key not in self.indexed_metadata_fields:
+                continue
+
             if isinstance(meta_value, list):
                 for val in meta_value:
                     composite_key = f"{meta_key}:{val}:{key}".encode('utf-8')
                     if add:
-                        txn.put(composite_key, b'', dk=self.db_metadata)
+                        txn.put(composite_key, b'', db=self.db_metadata)
                     else:
                         txn.delete(composite_key, db=self.db_metadata)
             else:
@@ -219,6 +226,7 @@ class VStore:
                     txn.put(composite_key, b'', db=self.db_metadata)
                 else:
                     txn.delete(composite_key, db=self.db_metadata)
+
                 if isinstance(meta_value, (int, float)):
                     padded_value = f"{float(meta_value):020.10f}"
                     numeric_key = f"{meta_key}:{padded_value}:{key}".encode('utf-8')
@@ -226,7 +234,6 @@ class VStore:
                         txn.put(numeric_key, b'', db=self.db_numeric_metadata)
                     else:
                         txn.delete(numeric_key, db=self.db_numeric_metadata)
-            self.logger.debug(f"{'Added' if add else 'Removed'} metadata {meta_key}:{meta_value} for key {key}")
 
     def _validate_filter(self, filter: Dict[str, Any]) -> None:
         if isinstance(filter, dict) and 'op' in filter:
@@ -461,30 +468,62 @@ class VStore:
 
     def search(self, vector: Union[np.ndarray, csr_matrix], top_k: int = 5,
                filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Optimized search operation with pre-filtering and early termination."""
         start_time = time.time()
         vector_to_search = self._prepare_vector(vector)
+
+        # Pre-filtering step
+        candidate_keys = None
+        candidate_indices = None
+
+        if filter:
+            with self.env.begin(write=False, buffers=True) as txn:
+                candidate_keys = self._filter_keys(filter, txn)
+                if not candidate_keys:
+                    return []
+
+                # Convert candidate keys to index IDs for more efficient filtering
+                candidate_indices = set()
+                for key in candidate_keys:
+                    idx_data = txn.get(key.encode('utf-8'), db=self.db_key_to_index)
+                    if idx_data:
+                        idx = msgpack.unpackb(idx_data, raw=False)
+                        candidate_indices.add(idx)
+
+        # Get total points to determine query size
         with self.env.begin(write=False, buffers=True) as txn:
             total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
             if total_points == 0 or not self.index_initialized:
                 return []
 
-            candidate_keys = self._filter_keys(filter, txn) if filter else None
-            max_candidates = top_k * 100
+        # Perform search with read lock
+        with self.index_lock:
             candidates = []
             query_k = min(top_k * 10, total_points)
-            while len(candidates) < top_k and query_k <= max_candidates:
-                with self.index_lock:
-                    try:
-                        ids, distances = self.index.knnQuery(vector_to_search, k=query_k)
-                    except Exception as e:
-                        self.logger.error(f"Search failed: {e}")
-                        return []
-                for idx, dist in zip(ids, distances):
-                    key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
-                    if key is None:
-                        continue
-                    key_str = key.tobytes().decode('utf-8')
-                    if candidate_keys is None or key_str in candidate_keys:
+            max_candidates = top_k * 100
+            found_enough = False
+
+            while len(candidates) < top_k and query_k <= max_candidates and not found_enough:
+                try:
+                    ids, distances = self.index.knnQuery(vector_to_search, k=query_k)
+                except Exception as e:
+                    self.logger.error(f"Search failed: {e}")
+                    return []
+
+                # Process results in a single transaction
+                with self.env.begin(write=False, buffers=True) as txn:
+                    for idx, dist in zip(ids, distances):
+                        if candidate_indices is not None and idx not in candidate_indices:
+                            continue
+
+                        key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
+                        if key is None:
+                            continue
+                        key_str = key.tobytes().decode('utf-8')
+
+                        if candidate_keys is not None and key_str not in candidate_keys:
+                            continue
+
                         data = self._get_data(key_str, txn)
                         candidates.append({
                             'key': key_str,
@@ -492,13 +531,22 @@ class VStore:
                             'metadata': data['metadata'],
                             'score': float(1 - dist)
                         })
+
+                        # Early exit if we have enough candidates
                         if len(candidates) >= top_k:
+                            found_enough = True
                             break
-                if len(candidates) >= top_k:
-                    break
-                query_k = min(query_k * 2, max_candidates)
-            self.logger.info(f"Search operation completed in {time.time() - start_time:.2f} seconds with {len(candidates)} results")
-            return candidates
+
+                if not found_enough:
+                    query_k = min(query_k * 2, max_candidates)
+
+            # Sort by score if we have more candidates than needed
+            if len(candidates) > top_k:
+                candidates.sort(key=lambda x: x['score'], reverse=True)
+                candidates = candidates[:top_k]
+
+        self.logger.info(f"Search operation completed in {time.time() - start_time:.2f} seconds with {len(candidates)} results")
+        return candidates
 
     def batch_put(self, list_of_entries: List[Dict[str, Any]]) -> List[str]:
         start_time = time.time()
