@@ -508,12 +508,12 @@ class VStore:
             with self.index_lock:
                 while len(candidates) < top_k and query_k <= max_candidates and not found_enough:
                     try:
-                        ids, distances = self.index.knnQuery(vector_to_search, k=query_k)
+                        ids, similarities = self.index.knnQuery(vector_to_search, k=query_k)
                     except Exception as e:
                         self.logger.error(f"Search failed: {e}")
                         return []
 
-                    for idx, dist in zip(ids, distances):
+                    for idx, similarity in zip(ids, similarities):
                         if candidate_indices is not None and idx not in candidate_indices:
                             continue
                         key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
@@ -527,7 +527,7 @@ class VStore:
                             'key': key_str,
                             'value': data['value'],
                             'metadata': data['metadata'],
-                            'score': float(1 - dist)
+                            'score': similarity
                         })
                         if len(candidates) >= top_k:
                             found_enough = True
@@ -631,14 +631,14 @@ class VStore:
             while True:
                 with self.index_lock:
                     try:
-                        ids_dists = self.index.knnQueryBatch(list_of_vectors_to_search, k=query_k, num_threads=cpu_count())
+                        ids_similarities = self.index.knnQueryBatch(list_of_vectors_to_search, k=query_k, num_threads=cpu_count())
                     except Exception as e:
                         self.logger.error(f"Batch search failed: {e}")
                         return [[] for _ in list_of_vectors]
                 results_all = []
-                for ids, distances in ids_dists:
+                for ids, similarities in ids_similarities:
                     results = []
-                    for idx, dist in zip(ids, distances):
+                    for idx, similarity in zip(ids, similarities):
                         key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
                         if key is None:
                             continue
@@ -649,7 +649,7 @@ class VStore:
                                 'key': key_str,
                                 'value': data['value'],
                                 'metadata': data['metadata'],
-                                'score': float(1 - dist)
+                                'score': similarity
                             })
                             if len(results) >= top_k:
                                 break
