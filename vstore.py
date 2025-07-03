@@ -106,12 +106,14 @@ class VStore:
         try:
             if os.path.exists(self.index_path):
                 with self.index_lock:
-                    self.index.loadIndex(self.index_path, load_data=True)
-                    self.index.setQueryTimeParams(self.query_params)
-                    self.index_initialized = True
-                self.logger.info(f"Loaded NMSLIB index from {self.index_path}")
-            else:
-                self.logger.debug("No existing index found, initializing new index")
+                    try:
+                        self.index.loadIndex(self.index_path, load_data=True)
+                        self.index.setQueryTimeParams(self.query_params)
+                        self.index_initialized = True
+                        self.logger.info(f"Loaded NMSLIB index from {self.index_path}")
+                    except Exception as e:
+                        self.logger.error(f"Error loading index from {self.index_path}: {e}")
+                        self.index_initialized = False
 
             # Load vector dimensionality
             with self.env.begin(write=False, buffers=True) as txn:
@@ -119,6 +121,7 @@ class VStore:
                 if vector_dim is None:
                     # Check existing vectors to set dimension
                     cursor = txn.cursor(db=self.db_data)
+                    found_vector = False
                     for key, value in cursor:
                         if not key.startswith(b'deleted:'):
                             try:
@@ -127,14 +130,20 @@ class VStore:
                                 self.vector_dim = vector.shape[0] if self.vector_type == 'dense' else vector.shape[1]
                                 with self.env.begin(write=True) as txn2:
                                     txn2.put(b'vector_dim', msgpack.packb(self.vector_dim, use_bin_type=True), db=self.db_system_metadata)
+                                self.logger.debug(f"Set vector dimension to {self.vector_dim}")
+                                found_vector = True
                                 break
                             except Exception as e:
-                                self.logger.error(f"Error reading vector dimension: {e}")
+                                self.logger.debug(f"Error reading vector dimension: {e}")
                                 continue
+                    if not found_vector:
+                        self.logger.debug("No valid vectors found in the database to determine dimension")
+                        self.vector_dim = None  # Dimension will be set when first vector is inserted
                 else:
                     self.vector_dim = vector_dim
 
-            # Preload index if not already loaded
+            # Only attempt to rebuild index if we have vectors
+            # Otherwise, we'll initialize an empty index which is fine
             if not self.index_initialized:
                 with self.index_lock:
                     vectors = []
@@ -161,6 +170,17 @@ class VStore:
                                 doc_key = key[8:].decode('utf-8')
                                 deleted_keys.add(doc_key)
 
+                        # Count non-deleted vectors
+                        non_deleted_count = 0
+                        for doc_key in key_to_idx.keys():
+                            if doc_key not in deleted_keys:
+                                non_deleted_count += 1
+
+                        if non_deleted_count == 0:
+                            self.logger.debug("Database is empty or contains only deleted vectors - initializing empty index")
+                            self.index_initialized = True
+                            return
+
                         # Collect vectors for non-deleted keys
                         for doc_key, idx in key_to_idx.items():
                             if doc_key not in deleted_keys:
@@ -174,24 +194,33 @@ class VStore:
                                         indices.append(idx)
                                     except Exception as e:
                                         self.logger.error(f"Error processing vector for key {doc_key}: {e}")
+                                        continue
 
-                    # Add vectors to index if any were found
                     if vectors:
+                        self.logger.debug(f"Found {len(vectors)} valid vectors to initialize index")
                         self.index.addDataPointBatch(vectors, indices)
                         self.index.createIndex(self.hnsw_params, print_progress=True)
                         self.index.setQueryTimeParams(self.query_params)
                         self.index_initialized = True
                     else:
-                        self.logger.warning("No valid vectors found during index loading")
+                        # Even if we have no vectors, mark index as initialized to avoid repeated attempts
+                        self.logger.debug("No valid vectors found, initializing empty index")
+                        self.index_initialized = True
 
         except lmdb.Error as e:
             self.logger.error(f"LMDB error during load: {e}")
             raise
         except Exception as e:
-            self.logger.error(f"Failed to load index: {e}. Rebuilding index.")
-            with self.env.begin(write=True, buffers=True) as txn:
-                self._rebuild_index(txn)
-                self._save_state(txn)
+            self.logger.error(f"Failed to load index: {e}. Will attempt to rebuild.")
+            # If we fail to load the index, try to rebuild it
+            try:
+                with self.env.begin(write=True, buffers=True) as txn:
+                    self._rebuild_index(txn)
+                    self._save_state(txn)
+            except Exception as rebuild_error:
+                self.logger.error(f"Failed to rebuild index: {rebuild_error}")
+                raise
+
 
     def _prepare_vector(self, vector: Union[np.ndarray, csr_matrix]) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """Prepare a vector for insertion into the index."""
