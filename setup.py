@@ -10,7 +10,7 @@ setup(
     name="vstore",
     version="0.1.0",
     author="Bijin Regi Panicker",
-    author_email="",
+    author_email="bijinregipanicker@gmail.com",
     description="Embedded key-value store with vector similarity search",
     long_description=long_description,
     long_description_content_type="text/markdown",

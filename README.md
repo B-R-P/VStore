@@ -21,17 +21,10 @@ A high-performance vector database implemented in Python, utilizing **NMSLIB** f
   - `numpy`
   - `scipy`
 
-### Install Dependencies
+### Installation
 
 ```bash
-pip install lmdb msgpack fixed-install-nmslib numpy scipy
-```
-
-### Clone the Repository
-
-```bash
-git clone https://github.com/B-R-P/VStore.git
-cd VStore
+pip install git+https://github.com/B-R-P/VStore.git
 ```
 
 ## Usage
