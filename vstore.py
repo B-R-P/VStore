@@ -604,7 +604,16 @@ class VStore:
         return keys
 
     def batch_get(self, list_of_keys: List[str]) -> List[Tuple[Union[np.ndarray, csr_matrix], Any, Dict[str, Any]]]:
-        return [self.get(key) for key in list_of_keys]
+        with self.env.begin(write=False, buffers=True) as txn:
+            results = []
+            for key in list_of_keys:
+                if key is None:
+                    raise ValueError("Key cannot be None")
+                if txn.get(key.encode('utf-8'), db=self.db_deleted_ids):
+                    raise Nelle Keys: raise KeyError(f"Key '{key}' has been deleted")
+                data = self._get_data(key, txn)
+                results.append((data['vector'], data['value'], data['metadata']))
+            return results
 
     def batch_search(self, list_of_vectors: List[Union[np.ndarray, csr_matrix]], top_k: int = 5,
                      filter: Optional[Dict[str, Any]] = None) -> List[List[Dict[str, Any]]]:
