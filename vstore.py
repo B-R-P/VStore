@@ -32,7 +32,8 @@ class VStore:
     def __init__(self, db_path: str, vector_type: str = 'dense', space: str = 'cosinesimil',
                  map_size: int = int(1e9), hnsw_params: Dict[str, Any] = None,
                  query_params: Dict[str, Any] = None, rebuild_threshold: float = 0.1,
-                 max_workers: int = cpu_count(), max_map_size: int = 2**40):
+                 max_workers: int = cpu_count(), max_map_size: int = 2**40,
+                 indexed_metadata_fields: Optional[List[str]] = None):
         self.db_path = db_path
         self.vector_type = vector_type
         self.space = space if vector_type == 'dense' else f"{space}_sparse"
