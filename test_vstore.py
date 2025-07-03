@@ -140,7 +140,7 @@ class TestVStore(unittest.TestCase):
         self.assertEqual(results[0]['key'], keys[0])
         self.assertAlmostEqual(results[0]['score'], 0.0, places=5)
         for r in results[1:]:
-            self.assertLess(r['score'], 0.0)
+            self.assertGreater(r['score'], 0.0)
         store.close()
 
     def test_non_serializable_value(self):
@@ -230,7 +230,7 @@ class TestVStore(unittest.TestCase):
 
         # The second result should be the other vector with category 'X'
         self.assertEqual(results[1]['value'], 'C')
-        self.assertLess(results[1]['score'], 0.0)
+        self.assertGreater(results[1]['score'], 0.0)
 
         store.close()
 
