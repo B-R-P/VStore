@@ -16,33 +16,36 @@ class VStore:
     """A vector database using NMSLIB for ANN search, LMDB for storage, and MessagePack for serialization.
 
     Supports dense (np.ndarray) and sparse (csr_matrix) vectors with metadata filtering and persistence.
-    The value field can be any MessagePack-serializable type (e.g., str, int, list, dict).
+    Optimized for read-heavy use cases with efficient query handling and minimal write overhead.
 
     Args:
         db_path (str): Path to the LMDB database directory.
         vector_type (str): 'dense' or 'sparse' vectors. Default: 'dense'.
         space (str): Distance metric for NMSLIB (e.g., 'cosinesimil', 'l2'). Default: 'cosinesimil'.
         map_size (int): Initial LMDB map size in bytes. Default: 1e9.
-        hnsw_params (Dict[str, Any]): HNSW parameters for NMSLIB. Default: {'M': 16, 'efConstruction': 200, 'post': 2}.
-        query_params (Dict[str, Any]): Query-time parameters for NMSLIB. Default: {'efSearch': 100}.
-        rebuild_threshold (float): Fraction of modified points triggering index rebuild. Default: 0.1.
+        hnsw_params (Dict[str, Any]): HNSW parameters for NMSLIB. Default: {'M': 32, 'efConstruction': 200, 'post': 2}.
+        query_params (Dict[str, Any]): Query-time parameters for NMSLIB. Default: {'efSearch': 200}.
+        rebuild_threshold (float): Fraction of modified points triggering index rebuild. Default: 0.5.
         max_workers (int): Number of threads for parallel operations. Default: cpu_count().
         max_map_size (int): Maximum LMDB map size in bytes. Default: 2**40 (1TB).
+        max_readers (int): Maximum concurrent LMDB readers. Default: 1000.
+        indexed_metadata_fields (Optional[List[str]]): Fields to index for faster filtering.
     """
     def __init__(self, db_path: str, vector_type: str = 'dense', space: str = 'cosinesimil',
                  map_size: int = int(1e9), hnsw_params: Dict[str, Any] = None,
-                 query_params: Dict[str, Any] = None, rebuild_threshold: float = 0.1,
+                 query_params: Dict[str, Any] = None, rebuild_threshold: float = 0.5,
                  max_workers: int = cpu_count(), max_map_size: int = 2**40,
-                 indexed_metadata_fields: Optional[List[str]] = None):
+                 max_readers: int = 1000, indexed_metadata_fields: Optional[List[str]] = None):
         self.db_path = db_path
         self.vector_type = vector_type
         self.space = space if vector_type == 'dense' else f"{space}_sparse"
-        self.env = lmdb.open(db_path, map_size=map_size, max_dbs=7, writemap=True)
-        self.hnsw_params = hnsw_params or {'M': 16, 'efConstruction': 200, 'post': 2}
-        self.query_params = query_params or {'efSearch': 100}
+        self.env = lmdb.open(db_path, map_size=map_size, max_dbs=7, writemap=True, max_readers=max_readers)
+        self.hnsw_params = hnsw_params or {'M': 32, 'efConstruction': 200, 'post': 2}
+        self.query_params = query_params or {'efSearch': 200}
         self.rebuild_threshold = rebuild_threshold
         self.max_map_size = max_map_size
-        self.indexed_metadata_fields = indexed_metadata_fields  # Focused optimization
+        self.max_readers = max_readers
+        self.indexed_metadata_fields = indexed_metadata_fields
         self.index = nmslib.init(method='hnsw', space=self.space,
                                 data_type=nmslib.DataType.DENSE_VECTOR if vector_type == 'dense' else nmslib.DataType.SPARSE_VECTOR)
         self.index_path = os.path.join(db_path, "index.nms")
@@ -51,7 +54,7 @@ class VStore:
         self.vector_dim = None
         self.logger = logging.getLogger(__name__)
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
-        self.index_lock = threading.Lock()  # Simpler lock for most cases
+        self.index_lock = threading.Lock()
 
         with self.env.begin(write=True) as txn:
             self.db_data = self.env.open_db(b'data', txn=txn)
@@ -110,11 +113,9 @@ class VStore:
                 self.logger.info(f"Loaded NMSLIB index from {self.index_path}")
             else:
                 self.logger.debug("No existing index found, initializing new index")
-            # Load vector dimensionality
             with self.env.begin(buffers=True) as txn:
                 vector_dim = msgpack.unpackb(txn.get(b'vector_dim', db=self.db_metadata), raw=False)
                 if vector_dim is None:
-                    # Check existing vectors to set dimension
                     with txn.cursor(db=self.db_data) as cursor:
                         for _, value in cursor:
                             data = msgpack.unpackb(value, raw=False, ext_hook=self._ext_hook, use_list=False)
@@ -194,6 +195,10 @@ class VStore:
             if vector.dtype != np.float32:
                 self.logger.debug("Converting dense vector to float32")
                 vector = vector.astype(np.float32)
+            if self.space == 'cosinesimil':
+                norm = np.linalg.norm(vector)
+                if norm > 0:
+                    vector = vector / norm
             return vector
         elif self.vector_type == 'sparse':
             if not isinstance(vector, csr_matrix) or vector.nnz == 0:
@@ -204,16 +209,17 @@ class VStore:
             if vector.dtype != np.float32:
                 self.logger.debug("Converting sparse vector data to float32")
                 vector = csr_matrix((vector.data.astype(np.float32), vector.indices, vector.indptr), shape=vector.shape)
+            if self.space == 'cosinesimil_sparse':
+                norm = np.sqrt(np.sum(vector.data ** 2))
+                if norm > 0:
+                    vector = csr_matrix((vector.data / norm, vector.indices, vector.indptr), shape=vector.shape)
             return (vector.indices, vector.data)
         raise ValueError(f"Unsupported vector_type: {self.vector_type}")
 
     def _update_metadata(self, key: str, metadata: Dict[str, Any], add: bool = True, txn=None):
-        """Optimized metadata update with selective indexing."""
         for meta_key, meta_value in metadata.items():
-            # Skip non-indexed fields if selective indexing is enabled
             if self.indexed_metadata_fields is not None and meta_key not in self.indexed_metadata_fields:
                 continue
-
             if isinstance(meta_value, list):
                 for val in meta_value:
                     composite_key = f"{meta_key}:{val}:{key}".encode('utf-8')
@@ -227,7 +233,6 @@ class VStore:
                     txn.put(composite_key, b'', db=self.db_metadata)
                 else:
                     txn.delete(composite_key, db=self.db_metadata)
-
                 if isinstance(meta_value, (int, float)):
                     padded_value = f"{float(meta_value):020.10f}"
                     numeric_key = f"{meta_key}:{padded_value}:{key}".encode('utf-8')
@@ -246,6 +251,15 @@ class VStore:
             for key, value in filter.items():
                 if isinstance(value, list) and len(value) != 2:
                     raise ValueError(f"Range filter for '{key}' must be a list of [min, max]")
+
+    def _estimate_filter_selectivity(self, filter: Optional[Dict[str, Any]], total_points: int) -> float:
+        if not filter:
+            return 1.0
+        if isinstance(filter, dict) and 'op' in filter:
+            selectivities = [self._estimate_filter_selectivity(cond, total_points) for cond in filter['conditions']]
+            return min(selectivities) if filter['op'] == 'AND' else sum(selectivities) / len(selectivities)
+        selectivity = 0.1  # Default estimate for single condition
+        return max(0.001, min(1.0, selectivity))  # Bound between 0.1% and 100%
 
     def _filter_keys(self, filter: Optional[Dict[str, Any]], txn) -> set:
         if not filter:
@@ -271,7 +285,6 @@ class VStore:
             if isinstance(condition, list) and isinstance(condition[0], (int, float)):
                 cursor = txn.cursor(db=self.db_numeric_metadata)
                 start_key = f"{key}:{float(condition[0]):020.10f}:".encode('utf-8')
-                # Add a small epsilon to the upper bound to include it in the range
                 upper_bound = condition[1] + 1e-10
                 end_key = f"{key}:{float(upper_bound):020.10f}:".encode('utf-8')
                 cursor.set_range(start_key)
@@ -330,26 +343,23 @@ class VStore:
         except Exception as e:
             raise ValueError(f"Value must be MessagePack-serializable: {e}")
         vector_to_add = self._prepare_vector(vector)
-        # Set vector dimension if not already set
         with self.env.begin(write=True, buffers=True) as txn:
+            self._resize_if_needed(txn)
             if self.vector_dim is None:
                 self.vector_dim = vector.shape[0] if self.vector_type == 'dense' else vector.shape[1]
                 txn.put(b'vector_dim', msgpack.packb(self.vector_dim, use_bin_type=True), db=self.db_metadata)
                 self.logger.debug(f"Set vector dimension to {self.vector_dim}")
 
-        if key is None:
-            max_retries = 5
-            for i in range(max_retries):
-                key = str(uuid.uuid4())
-                with self.env.begin() as txn:
+            if key is None:
+                max_retries = 5
+                for i in range(max_retries):
+                    key = str(uuid.uuid4())
                     if not txn.get(key.encode('utf-8'), db=self.db_key_to_index):
                         break
-                if i == max_retries - 1:
-                    self.logger.warning("Failed to generate unique key after retries")
-                    raise ValueError(f"Failed to generate unique key after {max_retries} retries")
+                    if i == max_retries - 1:
+                        self.logger.warning("Failed to generate unique key after retries")
+                        raise ValueError(f"Failed to generate unique key after {max_retries} retries")
 
-        with self.env.begin(write=True, buffers=True) as txn:
-            self._resize_if_needed(txn)
             if txn.get(key.encode('utf-8'), db=self.db_key_to_index):
                 raise ValueError(f"Key '{key}' already exists. Use update() to modify.")
 
@@ -359,7 +369,6 @@ class VStore:
 
             with self.index_lock:
                 self.index.addDataPoint(idx, vector_to_add)
-                self.index.createIndex(self.hnsw_params, print_progress=True)
                 self.index_initialized = True
 
             data = {'vector': vector, 'value': value, 'metadata': metadata or {}}
@@ -447,7 +456,6 @@ class VStore:
                 idx = msgpack.unpackb(txn.get(key.encode('utf-8'), db=self.db_key_to_index), raw=False)
                 with self.index_lock:
                     self.index.addDataPoint(idx, vector_to_add)
-                    self.index.createIndex(self.hnsw_params, print_progress=True)
                     self.index_initialized = True
             if value is not None:
                 data['value'] = value
@@ -469,21 +477,21 @@ class VStore:
 
     def search(self, vector: Union[np.ndarray, csr_matrix], top_k: int = 5,
                filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Optimized search operation with pre-filtering and early termination."""
         start_time = time.time()
         vector_to_search = self._prepare_vector(vector)
 
-        # Pre-filtering step
         candidate_keys = None
         candidate_indices = None
 
-        if filter:
-            with self.env.begin(write=False, buffers=True) as txn:
+        with self.env.begin(write=False, buffers=True) as txn:
+            total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
+            if total_points == 0 or not self.index_initialized:
+                return []
+
+            if filter:
                 candidate_keys = self._filter_keys(filter, txn)
                 if not candidate_keys:
                     return []
-
-                # Convert candidate keys to index IDs for more efficient filtering
                 candidate_indices = set()
                 for key in candidate_keys:
                     idx_data = txn.get(key.encode('utf-8'), db=self.db_key_to_index)
@@ -491,40 +499,29 @@ class VStore:
                         idx = msgpack.unpackb(idx_data, raw=False)
                         candidate_indices.add(idx)
 
-        # Get total points to determine query size
-        with self.env.begin(write=False, buffers=True) as txn:
-            total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
-            if total_points == 0 or not self.index_initialized:
-                return []
-
-        # Perform search with read lock
-        with self.index_lock:
-            candidates = []
-            query_k = min(top_k * 10, total_points)
+            selectivity = self._estimate_filter_selectivity(filter, total_points)
+            query_k = min(max(int(top_k / selectivity), top_k * 10), total_points)
             max_candidates = top_k * 100
+            candidates = []
             found_enough = False
 
-            while len(candidates) < top_k and query_k <= max_candidates and not found_enough:
-                try:
-                    ids, distances = self.index.knnQuery(vector_to_search, k=query_k)
-                except Exception as e:
-                    self.logger.error(f"Search failed: {e}")
-                    return []
+            with self.index_lock:
+                while len(candidates) < top_k and query_k <= max_candidates and not found_enough:
+                    try:
+                        ids, distances = self.index.knnQuery(vector_to_search, k=query_k)
+                    except Exception as e:
+                        self.logger.error(f"Search failed: {e}")
+                        return []
 
-                # Process results in a single transaction
-                with self.env.begin(write=False, buffers=True) as txn:
                     for idx, dist in zip(ids, distances):
                         if candidate_indices is not None and idx not in candidate_indices:
                             continue
-
                         key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
                         if key is None:
                             continue
                         key_str = key.tobytes().decode('utf-8')
-
                         if candidate_keys is not None and key_str not in candidate_keys:
                             continue
-
                         data = self._get_data(key_str, txn)
                         candidates.append({
                             'key': key_str,
@@ -532,16 +529,12 @@ class VStore:
                             'metadata': data['metadata'],
                             'score': float(1 - dist)
                         })
-
-                        # Early exit if we have enough candidates
                         if len(candidates) >= top_k:
                             found_enough = True
                             break
+                    if not found_enough:
+                        query_k = min(query_k * 2, max_candidates)
 
-                if not found_enough:
-                    query_k = min(query_k * 2, max_candidates)
-
-            # Sort by score if we have more candidates than needed
             if len(candidates) > top_k:
                 candidates.sort(key=lambda x: x['score'], reverse=True)
                 candidates = candidates[:top_k]
@@ -623,8 +616,9 @@ class VStore:
                 return [[] for _ in list_of_vectors]
 
             candidate_keys = self._filter_keys(filter, txn) if filter else None
+            selectivity = self._estimate_filter_selectivity(filter, total_points)
+            query_k = min(max(int(top_k / selectivity), top_k * 10), total_points)
             max_candidates = top_k * 100
-            query_k = min(top_k * 10, total_points)
             while True:
                 with self.index_lock:
                     try:
