@@ -11,18 +11,6 @@ A high-performance vector database implemented in Python, utilizing **NMSLIB** f
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.8+
-- Required packages:
-  - `lmdb`
-  - `msgpack`
-  - `nmslib`
-  - `numpy`
-  - `scipy`
-
-### Installation
-
 ```bash
 pip install git+https://github.com/B-R-P/VStore.git
 ```
