@@ -476,7 +476,7 @@ class VStore:
         self.logger.info(f"Update operation completed in {time.time() - start_time:.2f} seconds")
 
     def search(self, vector: Union[np.ndarray, csr_matrix], top_k: int = 5,
-               filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+               filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[Dict[str, Any]]:
         start_time = time.time()
         vector_to_search = self._prepare_vector(vector)
 
@@ -536,7 +536,7 @@ class VStore:
                         query_k = min(query_k * 2, max_candidates)
 
             if len(candidates) > top_k:
-                candidates.sort(key=lambda x: x['score'], reverse=True)
+                candidates.sort(key=lambda x: x['score'], reverse=sort_descending)
                 candidates = candidates[:top_k]
 
         self.logger.info(f"Search operation completed in {time.time() - start_time:.2f} seconds with {len(candidates)} results")
@@ -616,7 +616,7 @@ class VStore:
             return results
 
     def batch_search(self, list_of_vectors: List[Union[np.ndarray, csr_matrix]], top_k: int = 5,
-                     filter: Optional[Dict[str, Any]] = None) -> List[List[Dict[str, Any]]]:
+                     filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[List[Dict[str, Any]]]:
         start_time = time.time()
         list_of_vectors_to_search = [self._prepare_vector(v) for v in list_of_vectors]
         with self.env.begin(write=False, buffers=True) as txn:
@@ -653,6 +653,7 @@ class VStore:
                             })
                             if len(results) >= top_k:
                                 break
+                    results.sort(key=lambda x: x['score'], reverse=sort_descending)
                     results_all.append(results)
                 if all(len(res) >= top_k for res in results_all) or query_k >= max_candidates:
                     break
