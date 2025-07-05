@@ -184,7 +184,7 @@ class VStore:
             raise KeyError(f"Key '{key}' not found")
         return msgpack.unpackb(value, raw=False, ext_hook=self._ext_hook, use_list=False)
 
-    def _prepare_vector(self, vector: Union[np.ndarray, csr_matrix]) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    def _prepare_vector(self, vector: Union[np.ndarray, csr_matrix]) -> Union[np.ndarray, List[Tuple[int, float]]]:
         if self.vector_type == 'dense':
             if not isinstance(vector, np.ndarray):
                 raise ValueError("Dense vector must be a NumPy array")
@@ -214,7 +214,8 @@ class VStore:
                 norm = np.sqrt(np.sum(vector.data ** 2))
                 if norm > 0:
                     vector = csr_matrix((vector.data / norm, vector.indices, vector.indptr), shape=vector.shape)
-            return (vector.indices, vector.data)
+            # Convert to list of (index, value) pairs for NMSLIB
+            return list(zip(vector.indices, vector.data))
         raise ValueError(f"Unsupported vector_type: {self.vector_type}")
 
     def _update_metadata(self, key: str, metadata: Dict[str, Any], add: bool = True, txn=None):
@@ -329,8 +330,11 @@ class VStore:
         info = self.env.info()
         stat = self.env.stat()
         used = (info['last_pgno'] + 1) * stat['psize']
-        if used > info['map_size'] * 0.8:
-            new_size = min(info['map_size'] * 2, self.max_map_size)
+        page_size = os.sysconf('SC_PAGESIZE') if hasattr(os, 'sysconf') else 4096  # Default to 4096
+        if used > info['map_size'] * 0.6:  # Lowered threshold to 60%
+            new_size = min(info['map_size'] * 4, self.max_map_size)
+            # Round up to nearest multiple of page_size
+            new_size = ((new_size + page_size - 1) // page_size) * page_size
             try:
                 self.env.set_mapsize(new_size)
                 self.logger.info(f"Resized map_size to {new_size} bytes")
@@ -411,7 +415,7 @@ class VStore:
         with self.env.begin(write=True, buffers=True) as txn:
             self._resize_if_needed(txn)
             if not txn.get(key.encode('utf-8'), db=self.db_key_to_index) or \
-               txn.get(key.encode('utf-8'), db=self.db_deleted_ids):
+              txn.get(key.encode('utf-8'), db=self.db_deleted_ids):
                 self.logger.info(f"Key '{key}' not found or already deleted")
                 return
 
@@ -429,14 +433,14 @@ class VStore:
             if total_points > 0:
                 txn.put(b'total_points', msgpack.packb(total_points - 1, use_bin_type=True), db=self.db_metadata)
 
-        self.modifications_since_rebuild += 1
-        with self.env.begin(write=True, buffers=True) as txn:
-            total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
+            self.modifications_since_rebuild += 1  # Increment before threshold check
+
             if total_points > 0 and self.modifications_since_rebuild > self.rebuild_threshold * total_points:
                 self._rebuild_index(txn)
                 self._save_state(txn)
-        self.logger.info(f"Delete operation completed in {time.time() - start_time:.2f} seconds")
 
+        self.logger.info(f"Delete operation completed in {time.time() - start_time:.2f} seconds")
+  
     def update(self, key: str, vector: Optional[Union[np.ndarray, csr_matrix]] = None,
                value: Optional[Any] = None, metadata: Optional[Dict[str, Any]] = None):
         if key is None:
