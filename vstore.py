@@ -520,7 +520,7 @@ class VStore:
             raise ValueError(f"Value must be MessagePack-serializable: {e}")
         vector_to_add = self._prepare_vector(vector)
         with self.env.begin(write=True, buffers=True) as txn:
-            self._resize_if_needed(txn)
+            self._resize_if_needed()
             if self.vector_dim is None:
                 self.vector_dim = vector.shape[0] if self.vector_type == 'dense' else vector.shape[1]
                 txn.put(b'vector_dim', msgpack.packb(self.vector_dim, use_bin_type=True), db=self.db_metadata)
@@ -582,7 +582,7 @@ class VStore:
             raise ValueError("Key cannot be None")
         start_time = time.time()
         with self.env.begin(write=True, buffers=True) as txn:
-            self._resize_if_needed(txn)
+            self._resize_if_needed()
             if not txn.get(key.encode('utf-8'), db=self.db_key_to_index) or \
               txn.get(key.encode('utf-8'), db=self.db_deleted_ids):
                 self.logger.info(f"Key '{key}' not found or already deleted")
@@ -623,7 +623,7 @@ class VStore:
         vector_to_add = self._prepare_vector(vector) if vector is not None else None
 
         with self.env.begin(write=True, buffers=True) as txn:
-            self._resize_if_needed(txn)
+            self._resize_if_needed()
             if txn.get(key.encode('utf-8'), db=self.db_deleted_ids):
                 raise KeyError(f"Key '{key}' has been deleted")
             data = self._get_data(key, txn)
@@ -742,7 +742,7 @@ class VStore:
         indices = []
         keys = []
         with self.env.begin(write=True, buffers=True) as txn:
-            self._resize_if_needed(txn)
+            self._resize_if_needed()
             if self.vector_dim is None and list_of_entries:
                 self.vector_dim = list_of_entries[0]['vector'].shape[0] if self.vector_type == 'dense' else list_of_entries[0]['vector'].shape[1]
                 txn.put(b'vector_dim', msgpack.packb(self.vector_dim, use_bin_type=True), db=self.db_metadata)
