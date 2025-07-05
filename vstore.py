@@ -479,21 +479,37 @@ class VStore:
         self.logger.debug(f"Filtered {len(matched_keys)} keys, removed {len(deleted_keys)} deleted keys")
         return matched_keys - deleted_keys
 
-    def _resize_if_needed(self, txn):
-        info = self.env.info()
-        stat = self.env.stat()
-        used = (info['last_pgno'] + 1) * stat['psize']
-        page_size = os.sysconf('SC_PAGESIZE') if hasattr(os, 'sysconf') else 4096  # Default to 4096
-        if used > info['map_size'] * 0.6:  # Lowered threshold to 60%
-            new_size = min(info['map_size'] * 4, self.max_map_size)
-            # Round up to nearest multiple of page_size
-            new_size = ((new_size + page_size - 1) // page_size) * page_size
-            try:
-                self.env.set_mapsize(new_size)
-                self.logger.info(f"Resized map_size to {new_size} bytes")
-            except lmdb.Error as e:
-                self.logger.error(f"Failed to resize map_size: {e}. Current size: {info['map_size']}")
-                raise
+    def _resize_if_needed(self):
+        # Must not be inside a write transaction!
+        # Caller should ensure this function is called outside a txn or before starting a write txn
+        try:
+            info = self.env.info()
+            stat = self.env.stat()
+
+            used = (info['last_pgno'] + 1) * stat['psize']
+            current_map_size = info['map_size']
+
+            page_size = os.sysconf('SC_PAGESIZE') if hasattr(os, 'sysconf') else 4096
+
+            # Resize if more than 60% used
+            if used > current_map_size * 0.6:
+                new_size = min(current_map_size * 4, self.max_map_size)
+
+                # Round up to nearest page boundary
+                new_size = ((new_size + page_size - 1) // page_size) * page_size
+
+                if new_size > current_map_size:
+                    self.env.set_mapsize(new_size)
+                    self.logger.info(f"Resized map_size from {current_map_size} to {new_size} bytes")
+                else:
+                    self.logger.debug("Resize skipped: new_size not larger than current")
+
+        except lmdb.MapFullError as e:
+            self.logger.error(f"Map full error: {e}")
+            raise
+        except lmdb.Error as e:
+            self.logger.error(f"Failed to resize map_size: {e}. Current size: {current_map_size}")
+            raise
 
     def put(self, vector: Union[np.ndarray, csr_matrix], value: Any,
             metadata: Optional[Dict[str, Any]] = None, key: Optional[str] = None) -> str:
