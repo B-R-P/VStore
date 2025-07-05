@@ -535,7 +535,7 @@ class VStore:
                         continue
 
                     key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
-                    if key is None or txn.get(key, db=self.db_deleted_ids):
+                    if key is None:
                         continue
                     key_str = key.tobytes().decode('utf-8')
                     if candidate_keys is not None and key_str not in candidate_keys:
@@ -700,7 +700,7 @@ class VStore:
                             continue
 
                         key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
-                        if key is None or txn.get(key, db=self.db_deleted_ids):
+                        if key is None:
                             continue
                         key_str = key.tobytes().decode('utf-8')
                         if candidate_keys is not None and key_str not in candidate_keys:
