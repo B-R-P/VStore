@@ -139,30 +139,183 @@ class VStore:
     def _rebuild_index(self, txn):
         start_time = time.time()
         self.logger.info("Rebuilding NMSLIB index")
-        with self.index_lock:
-            self.index = nmslib.init(method='hnsw', space=self.space,
-                                     data_type=nmslib.DataType.DENSE_VECTOR if self.vector_type == 'dense' else nmslib.DataType.SPARSE_VECTOR)
-            vectors = []
-            indices = []
-            deleted_keys = set(k.decode('utf-8') if isinstance(k, bytes) else k.tobytes().decode('utf-8') for k, _ in txn.cursor(db=self.db_deleted_ids))
+
+        # Safety check - if we have no valid vectors, just return
+        try:
             with txn.cursor(db=self.db_key_to_index) as cursor:
-                for key, idx_data in cursor:
-                    key_str = key.decode('utf-8') if isinstance(key, bytes) else key.tobytes().decode('utf-8')
-                    if key_str in deleted_keys:
-                        continue
-                    idx = msgpack.unpackb(idx_data, raw=False)
-                    data = self._get_data(key_str, txn)
-                    vectors.append(self._prepare_vector(data['vector']))
-                    indices.append(idx)
-            if vectors:
-                self.index.addDataPointBatch(vectors, indices)
-                self.index.createIndex(self.hnsw_params, print_progress=True)
-                self.index_initialized = True
-            else:
+                if not cursor.first():
+                    self.logger.warning("No valid vectors found for index rebuilding")
+                    self.index_initialized = False
+                    self.modifications_since_rebuild = 0
+                    return
+        except Exception as e:
+            self.logger.error(f"Error checking for valid vectors: {e}")
+            self.index_initialized = False
+            self.modifications_since_rebuild = 0
+            return
+
+        with self.index_lock:
+            try:
+                # Initialize a new index with safety checks
+                try:
+                    self.index = nmslib.init(
+                        method='hnsw',
+                        space=self.space,
+                        data_type=nmslib.DataType.DENSE_VECTOR if self.vector_type == 'dense'
+                                  else nmslib.DataType.SPARSE_VECTOR
+                    )
+                except Exception as e:
+                    self.logger.error(f"Failed to initialize NMSLIB index: {e}")
+                    self.index_initialized = False
+                    self.modifications_since_rebuild = 0
+                    return
+
+                vectors = []
+                indices = []
+                deleted_keys = set()
+
+                # Safely collect deleted keys
+                try:
+                    with txn.cursor(db=self.db_deleted_ids) as cursor:
+                        for k, _ in cursor:
+                            try:
+                                key_str = k.decode('utf-8') if isinstance(k, bytes) else k.tobytes().decode('utf-8')
+                                deleted_keys.add(key_str)
+                            except Exception as e:
+                                self.logger.warning(f"Could not decode deleted key: {e}")
+                                continue
+                    self.logger.debug(f"Found {len(deleted_keys)} deleted keys")
+                except Exception as e:
+                    self.logger.warning(f"Could not retrieve deleted keys: {e}")
+
+                # Process valid vectors
+                try:
+                    with txn.cursor(db=self.db_key_to_index) as cursor:
+                        for key, idx_data in cursor:
+                            try:
+                                key_str = key.decode('utf-8') if isinstance(key, bytes) else key.tobytes().decode('utf-8')
+
+                                # Skip deleted keys
+                                if key_str in deleted_keys:
+                                    continue
+
+                                # Get and validate index data
+                                try:
+                                    idx = msgpack.unpackb(idx_data, raw=False)
+                                except Exception as e:
+                                    self.logger.warning(f"Could not unpack index data for key {key_str}: {e}")
+                                    continue
+
+                                # Get and validate the vector data
+                                try:
+                                    data = self._get_data(key_str, txn)
+                                    if not data or 'vector' not in data:
+                                        self.logger.warning(f"No vector data found for key {key_str}")
+                                        continue
+
+                                    # Prepare the vector with additional validation
+                                    vector = self._prepare_vector(data['vector'])
+
+                                    # Additional validation for the vector
+                                    if self.vector_type == 'dense':
+                                        if not isinstance(vector, np.ndarray):
+                                            raise ValueError("Expected numpy array for dense vector")
+                                        if vector.size == 0:
+                                            raise ValueError("Empty dense vector")
+                                    elif self.vector_type == 'sparse':
+                                        if not isinstance(vector, list):
+                                            raise ValueError("Expected list for sparse vector")
+                                        if len(vector) == 0:
+                                            raise ValueError("Empty sparse vector")
+
+                                    vectors.append(vector)
+                                    indices.append(idx)
+                                except Exception as e:
+                                    self.logger.warning(f"Error processing vector for key {key_str}: {e}")
+                                    continue
+
+                            except Exception as e:
+                                self.logger.warning(f"Error processing key {key}: {e}")
+                                continue
+
+                except Exception as e:
+                    self.logger.error(f"Error processing vectors: {e}")
+                    self.index_initialized = False
+                    self.modifications_since_rebuild = 0
+                    return
+
+                # Only proceed if we have valid vectors
+                if len(vectors) == 0:
+                    self.logger.warning("No valid vectors remaining after filtering")
+                    self.index_initialized = False
+                    self.modifications_since_rebuild = 0
+                    return
+
+                # Add vectors to the index with additional safety checks
+                try:
+                    self.logger.debug(f"Adding {len(vectors)} vectors to the index")
+
+                    # Validate vector dimensions
+                    if self.vector_type == 'dense':
+                        first_vector_length = len(vectors[0])
+                        for vec in vectors:
+                            if len(vec) != first_vector_length:
+                                raise ValueError(f"Inconsistent vector dimensions. Expected {first_vector_length}, got {len(vec)}")
+                    elif self.vector_type == 'sparse':
+                        # For sparse vectors, we can't easily check dimensions
+                        pass
+
+                    # Add data in chunks to avoid memory issues
+                    chunk_size = 1000
+                    for i in range(0, len(vectors), chunk_size):
+                        chunk_vectors = vectors[i:i+chunk_size]
+                        chunk_indices = indices[i:i+chunk_size]
+                        try:
+                            self.index.addDataPointBatch(chunk_vectors, chunk_indices)
+                        except Exception as e:
+                            self.logger.error(f"Failed to add chunk starting at index {i}: {e}")
+                            raise
+
+                    # Create index with safety checks
+                    try:
+                        # Use default params if our params somehow got corrupted
+                        params = self.hnsw_params or {}
+                        if not isinstance(params, dict):
+                            params = {'M': 32, 'efConstruction': 200, 'post': 2}
+
+                        self.index.createIndex(params, print_progress=True)
+                        self.index_initialized = True
+                    except Exception as e:
+                        self.logger.error(f"Failed to create index: {e}")
+                        self.index_initialized = False
+                        raise
+
+                    try:
+                        # Use default params if our query params got corrupted
+                        query_params = self.query_params or {}
+                        if not isinstance(query_params, dict):
+                            query_params = {'efSearch': 200}
+
+                        self.index.setQueryTimeParams(query_params)
+                    except Exception as e:
+                        self.logger.error(f"Failed to set query parameters: {e}")
+                        # Don't fail completely if we can't set query params
+
+                except Exception as e:
+                    self.logger.error(f"Error adding data points to index: {e}")
+                    self.index_initialized = False
+                    raise
+
+            except Exception as e:
+                self.logger.error(f"Error during index rebuild: {e}")
                 self.index_initialized = False
-            self.index.setQueryTimeParams(self.query_params)
+                raise
+
+        # Reset modifications counter
         self.modifications_since_rebuild = 0
         self.logger.info(f"Index rebuild completed in {time.time() - start_time:.2f} seconds")
+
+
 
     def _save_state(self, txn):
         if not self.index_initialized:
