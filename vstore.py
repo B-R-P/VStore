@@ -476,7 +476,7 @@ class VStore:
         self.logger.info(f"Update operation completed in {time.time() - start_time:.2f} seconds")
 
     def search(self, vector: Union[np.ndarray, csr_matrix], top_k: int = 5,
-               filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[Dict[str, Any]]:
+              filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[Dict[str, Any]]:
         start_time = time.time()
         vector_to_search = self._prepare_vector(vector)
 
@@ -514,7 +514,7 @@ class VStore:
                         self.logger.error(f"Search failed: {e}")
                         return []
 
-                    new_results = 0  # track how many new unique results added
+                    new_results = 0
 
                     for idx, similarity in zip(ids, similarities):
                         if idx in seen_indices:
@@ -540,20 +540,19 @@ class VStore:
                         })
                         new_results += 1
 
-                        if len(candidates) >= top_k:
-                            break
-
-                    if len(candidates) >= top_k or new_results == 0:
-                        break  # stop if enough results or no new unique items
+                    # break only when no new useful results are added
+                    if new_results == 0:
+                        break
                     else:
                         query_k = min(query_k * 2, max_candidates)
 
-            if len(candidates) > top_k:
-                candidates.sort(key=lambda x: x['score'], reverse=sort_descending)
-                candidates = candidates[:top_k]
+            # sort by score and return top_k
+            candidates.sort(key=lambda x: x['score'], reverse=sort_descending)
+            candidates = candidates[:top_k]
 
         self.logger.info(f"Search operation completed in {time.time() - start_time:.2f} seconds with {len(candidates)} results")
         return candidates
+
 
     def batch_put(self, list_of_entries: List[Dict[str, Any]]) -> List[str]:
         start_time = time.time()
@@ -629,7 +628,7 @@ class VStore:
             return results
 
     def batch_search(self, list_of_vectors: List[Union[np.ndarray, csr_matrix]], top_k: int = 5,
-                     filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[List[Dict[str, Any]]]:
+                 filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[List[Dict[str, Any]]]:
         start_time = time.time()
         list_of_vectors_to_search = [self._prepare_vector(v) for v in list_of_vectors]
 
@@ -639,6 +638,15 @@ class VStore:
                 return [[] for _ in list_of_vectors]
 
             candidate_keys = self._filter_keys(filter, txn) if filter else None
+            candidate_indices = None
+            if candidate_keys:
+                candidate_indices = set()
+                for key in candidate_keys:
+                    idx_data = txn.get(key.encode('utf-8'), db=self.db_key_to_index)
+                    if idx_data:
+                        idx = msgpack.unpackb(idx_data, raw=False)
+                        candidate_indices.add(idx)
+
             selectivity = self._estimate_filter_selectivity(filter, total_points)
             query_k = min(max(int(top_k / selectivity), top_k * 10), total_points)
             max_candidates = top_k * 100
@@ -646,7 +654,7 @@ class VStore:
             results_all = [[] for _ in list_of_vectors]
             seen_indices_all = [set() for _ in list_of_vectors]
 
-            while True:
+            while query_k <= max_candidates:
                 with self.index_lock:
                     try:
                         ids_similarities = self.index.knnQueryBatch(
@@ -664,12 +672,16 @@ class VStore:
                     for idx, similarity in zip(ids, similarities):
                         if idx in seen_indices:
                             continue
+                        if candidate_indices is not None and idx not in candidate_indices:
+                            continue
+
                         key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
                         if key is None:
                             continue
                         key_str = key.tobytes().decode('utf-8')
                         if candidate_keys is not None and key_str not in candidate_keys:
                             continue
+
                         data = self._get_data(key_str, txn)
                         results.append({
                             'key': key_str,
@@ -679,19 +691,21 @@ class VStore:
                         })
                         seen_indices.add(idx)
                         any_new_results = True
-                        if len(results) >= top_k:
-                            break
 
-                    # Sort after adding new results
-                    results.sort(key=lambda x: x['score'], reverse=sort_descending)
-
-                if all(len(res) >= top_k for res in results_all) or query_k >= max_candidates or not any_new_results:
+                if not any_new_results:
                     break
+                else:
+                    query_k = min(query_k * 2, max_candidates)
 
-                query_k = min(query_k * 2, max_candidates)
+            # Final sort and truncate for each query
+            for results in results_all:
+                results.sort(key=lambda x: x['score'], reverse=sort_descending)
+                if len(results) > top_k:
+                    del results[top_k:]
 
             self.logger.info(f"Batch search operation completed in {time.time() - start_time:.2f} seconds with {len(results_all)} queries")
             return results_all
+
 
 
     def count(self, filter: Optional[Dict[str, Any]] = None) -> int:

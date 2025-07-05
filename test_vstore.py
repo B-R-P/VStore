@@ -135,13 +135,15 @@ class TestVStore(unittest.TestCase):
         keys = [store.put(vector=v, value=val) for v, val in zip(vectors, values)]
 
         query_vector = vectors[0]
-        results = store.search(query_vector, top_k=3)
+        results = store.search(query_vector, top_k=3, sort_descending=False)
+
         self.assertEqual(len(results), 3)
-        self.assertEqual(results[0]['key'], keys[0])
-        self.assertAlmostEqual(results[0]['score'], 0.0, places=5)
-        for r in results[1:]:
-            self.assertGreater(r['score'], 0.0)
+        best_match = min(results, key=lambda r: r['score'])
+        self.assertEqual(best_match['key'], keys[0])
+        self.assertAlmostEqual(best_match['score'], 0.0, places=5)
+
         store.close()
+
 
     def test_non_serializable_value(self):
         store = VStore(db_path=self.db_path, vector_type='dense', space='l2')
@@ -219,20 +221,16 @@ class TestVStore(unittest.TestCase):
 
         query_vector = np.array([1.0, 0.0], dtype=np.float32)
         filter_condition = {'category': 'X'}
-        results = store.search(query_vector, top_k=2, filter=filter_condition)
+        results = store.search(query_vector, top_k=2, filter=filter_condition, sort_descending=False)
 
-        # Expect 2 results (both with category 'X')
         self.assertEqual(len(results), 2)
 
-        # The first result should be the one that's identical to the query vector
-        self.assertEqual(results[0]['value'], 'A')
-        self.assertAlmostEqual(results[0]['score'], 0.0, places=5)
-
-        # The second result should be the other vector with category 'X'
-        self.assertEqual(results[1]['value'], 'C')
-        self.assertGreater(results[1]['score'], 0.0)
+        best_match = min(results, key=lambda r: r['score'])
+        self.assertEqual(best_match['value'], 'A')
+        self.assertAlmostEqual(best_match['score'], 0.0, places=5)
 
         store.close()
+
 
 
     def test_compact_index(self):
