@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count
 from scipy.sparse import csr_matrix
 import threading
+import heapq
 
 class VStore:
     """A vector database using NMSLIB for ANN search, LMDB for storage, and MessagePack for serialization.
@@ -257,9 +258,11 @@ class VStore:
             return 1.0
         if isinstance(filter, dict) and 'op' in filter:
             selectivities = [self._estimate_filter_selectivity(cond, total_points) for cond in filter['conditions']]
-            return min(selectivities) if filter['op'] == 'AND' else sum(selectivities) / len(selectivities)
-        selectivity = 0.1  # Default estimate for single condition
-        return max(0.001, min(1.0, selectivity))  # Bound between 0.1% and 100%
+            return min(selectivities) if filter['op'] == 'AND' else 1 - (1 - sum(selectivities) / len(selectivities))**len(selectivities)
+        with self.env.begin(write=False) as txn:
+            sample_size = min(total_points, 1000)
+            matches = len(self._filter_keys(filter, txn))
+            return matches / sample_size if sample_size > 0 else 0.1
 
     def _filter_keys(self, filter: Optional[Dict[str, Any]], txn) -> set:
         if not filter:
@@ -476,17 +479,25 @@ class VStore:
         self.logger.info(f"Update operation completed in {time.time() - start_time:.2f} seconds")
 
     def search(self, vector: Union[np.ndarray, csr_matrix], top_k: int = 5,
-              filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[Dict[str, Any]]:
+               filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[Dict[str, Any]]:
         start_time = time.time()
         vector_to_search = self._prepare_vector(vector)
+
+        if self.vector_dim is None:
+            self.logger.info("No vector dimension set; returning empty results")
+            return []
 
         candidate_keys = None
         candidate_indices = None
 
-        with self.env.begin(write=False, buffers=True) as txn:
+        with self.env.begin(write=True, buffers=True) as txn:
             total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
             if total_points == 0 or not self.index_initialized:
                 return []
+
+            if total_points > 0 and self.modifications_since_rebuild > self.rebuild_threshold * total_points:
+                self._rebuild_index(txn)
+                self._save_state(txn)
 
             if filter:
                 candidate_keys = self._filter_keys(filter, txn)
@@ -500,59 +511,57 @@ class VStore:
                         candidate_indices.add(idx)
 
             selectivity = self._estimate_filter_selectivity(filter, total_points)
-            query_k = min(max(int(top_k / selectivity), top_k * 10), total_points)
+            query_k = min(max(int(top_k / max(selectivity, 0.01)), top_k * 10), total_points, 10000)
             max_candidates = top_k * 100
             candidates = []
-
             seen_indices = set()
+            counter = 0  # Unique counter for tiebreaking
 
-            with self.index_lock:
-                while query_k <= max_candidates:
-                    try:
-                        ids, similarities = self.index.knnQuery(vector_to_search, k=query_k)
-                    except Exception as e:
-                        self.logger.error(f"Search failed: {e}")
-                        return []
+            while query_k <= max_candidates:
+                try:
+                    ids, similarities = self.index.knnQuery(vector_to_search, k=query_k)
+                except nmslib.NMSLibError as e:
+                    self.logger.error(f"NMSLIB query failed: {e}")
+                    raise ValueError(f"Search failed due to NMSLIB error: {e}")
+                except Exception as e:
+                    self.logger.error(f"Unexpected error in search: {e}")
+                    return []
 
-                    new_results = 0
+                new_results = 0
+                for idx, similarity in zip(ids, similarities):
+                    if idx in seen_indices:
+                        continue
+                    if candidate_indices is not None and idx not in candidate_indices:
+                        continue
 
-                    for idx, similarity in zip(ids, similarities):
-                        if idx in seen_indices:
-                            continue
-                        if candidate_indices is not None and idx not in candidate_indices:
-                            continue
+                    key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
+                    if key is None or txn.get(key, db=self.db_deleted_ids):
+                        continue
+                    key_str = key.tobytes().decode('utf-8')
+                    if candidate_keys is not None and key_str not in candidate_keys:
+                        continue
 
-                        key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
-                        if key is None:
-                            continue
-                        key_str = key.tobytes().decode('utf-8')
-                        if candidate_keys is not None and key_str not in candidate_keys:
-                            continue
+                    data = self._get_data(key_str, txn)
+                    heapq.heappush(candidates, (-similarity if sort_descending else similarity, counter, {
+                        'key': key_str,
+                        'value': data['value'],
+                        'metadata': data['metadata'],
+                        'score': similarity
+                    }))
+                    seen_indices.add(idx)
+                    new_results += 1
+                    counter += 1
+                    if len(candidates) > top_k:
+                        heapq.heappop(candidates)
 
-                        data = self._get_data(key_str, txn)
+                if new_results == 0:
+                    break
+                query_k = min(int(query_k * 1.5), max_candidates)
 
-                        seen_indices.add(idx)
-                        candidates.append({
-                            'key': key_str,
-                            'value': data['value'],
-                            'metadata': data['metadata'],
-                            'score': similarity
-                        })
-                        new_results += 1
-
-                    # break only when no new useful results are added
-                    if new_results == 0:
-                        break
-                    else:
-                        query_k = min(query_k * 2, max_candidates)
-
-            # sort by score and return top_k
-            candidates.sort(key=lambda x: x['score'], reverse=sort_descending)
-            candidates = candidates[:top_k]
+            candidates = [item[2] for item in sorted(candidates, reverse=sort_descending)]
 
         self.logger.info(f"Search operation completed in {time.time() - start_time:.2f} seconds with {len(candidates)} results")
         return candidates
-
 
     def batch_put(self, list_of_entries: List[Dict[str, Any]]) -> List[str]:
         start_time = time.time()
@@ -628,18 +637,29 @@ class VStore:
             return results
 
     def batch_search(self, list_of_vectors: List[Union[np.ndarray, csr_matrix]], top_k: int = 5,
-                 filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[List[Dict[str, Any]]]:
+                     filter: Optional[Dict[str, Any]] = None, sort_descending: bool = True) -> List[List[Dict[str, Any]]]:
         start_time = time.time()
         list_of_vectors_to_search = [self._prepare_vector(v) for v in list_of_vectors]
 
-        with self.env.begin(write=False, buffers=True) as txn:
+        if self.vector_dim is None:
+            self.logger.info("No vector dimension set; returning empty results")
+            return [[] for _ in list_of_vectors]
+
+        with self.env.begin(write=True, buffers=True) as txn:
             total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
             if total_points == 0 or not self.index_initialized:
                 return [[] for _ in list_of_vectors]
 
+            # Check for index rebuild
+            if total_points > 0 and self.modifications_since_rebuild > self.rebuild_threshold * total_points:
+                self._rebuild_index(txn)
+                self._save_state(txn)
+
             candidate_keys = self._filter_keys(filter, txn) if filter else None
             candidate_indices = None
             if candidate_keys:
+                if not candidate_keys:
+                    return [[] for _ in list_of_vectors]
                 candidate_indices = set()
                 for key in candidate_keys:
                     idx_data = txn.get(key.encode('utf-8'), db=self.db_key_to_index)
@@ -648,27 +668,31 @@ class VStore:
                         candidate_indices.add(idx)
 
             selectivity = self._estimate_filter_selectivity(filter, total_points)
-            query_k = min(max(int(top_k / selectivity), top_k * 10), total_points)
+            query_k = min(max(int(top_k / max(selectivity, 0.01)), top_k * 10), total_points, 10000)
             max_candidates = top_k * 100
 
             results_all = [[] for _ in list_of_vectors]
             seen_indices_all = [set() for _ in list_of_vectors]
+            counters = [0 for _ in list_of_vectors]  # Unique counter for each query
 
             while query_k <= max_candidates:
-                with self.index_lock:
-                    try:
-                        ids_similarities = self.index.knnQueryBatch(
-                            list_of_vectors_to_search, k=query_k, num_threads=cpu_count()
-                        )
-                    except Exception as e:
-                        self.logger.error(f"Batch search failed: {e}")
-                        return [[] for _ in list_of_vectors]
+                try:
+                    ids_similarities = self.index.knnQueryBatch(
+                        list_of_vectors_to_search, k=query_k, num_threads=cpu_count()
+                    )
+                except nmslib.NMSLibError as e:
+                    self.logger.error(f"NMSLIB batch query failed: {e}")
+                    raise ValueError(f"Batch search failed due to NMSLIB error: {e}")
+                except Exception as e:
+                    self.logger.error(f"Unexpected error in batch search: {e}")
+                    return [[] for _ in list_of_vectors]
 
                 any_new_results = False
 
                 for i, (ids, similarities) in enumerate(ids_similarities):
                     results = results_all[i]
                     seen_indices = seen_indices_all[i]
+                    counter = counters[i]
                     for idx, similarity in zip(ids, similarities):
                         if idx in seen_indices:
                             continue
@@ -676,37 +700,36 @@ class VStore:
                             continue
 
                         key = txn.get(str(idx).encode('utf-8'), db=self.db_index_to_key)
-                        if key is None:
+                        if key is None or txn.get(key, db=self.db_deleted_ids):
                             continue
                         key_str = key.tobytes().decode('utf-8')
                         if candidate_keys is not None and key_str not in candidate_keys:
                             continue
 
                         data = self._get_data(key_str, txn)
-                        results.append({
+                        heapq.heappush(results, (-similarity if sort_descending else similarity, counter, {
                             'key': key_str,
                             'value': data['value'],
                             'metadata': data['metadata'],
                             'score': similarity
-                        })
+                        }))
                         seen_indices.add(idx)
                         any_new_results = True
+                        counter += 1
+                        if len(results) > top_k:
+                            heapq.heappop(results)
+                    counters[i] = counter
 
                 if not any_new_results:
                     break
-                else:
-                    query_k = min(query_k * 2, max_candidates)
+                query_k = min(int(query_k * 1.5), max_candidates)
 
             # Final sort and truncate for each query
-            for results in results_all:
-                results.sort(key=lambda x: x['score'], reverse=sort_descending)
-                if len(results) > top_k:
-                    del results[top_k:]
+            for i, results in enumerate(results_all):
+                results_all[i] = [item[2] for item in sorted(results, reverse=sort_descending)]
 
             self.logger.info(f"Batch search operation completed in {time.time() - start_time:.2f} seconds with {len(results_all)} queries")
             return results_all
-
-
 
     def count(self, filter: Optional[Dict[str, Any]] = None) -> int:
         with self.env.begin(write=False, buffers=True) as txn:
