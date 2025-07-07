@@ -955,12 +955,16 @@ class VStore:
             key_to_index_stats = txn.stat(db=self.db_key_to_index)
             index_to_key_stats = txn.stat(db=self.db_index_to_key)
             deleted_stats = txn.stat(db=self.db_deleted_ids)
+            total_points = msgpack.unpackb(txn.get(b'total_points', db=self.db_metadata), raw=False)
+            
             data_count = data_stats['entries']
             key_to_index_count = key_to_index_stats['entries']
             index_to_key_count = index_to_key_stats['entries']
             deleted_count = deleted_stats['entries']
-            if data_count != key_to_index_count or data_count != index_to_key_count + deleted_count:
-                raise ValueError(f"Inconsistent counts: data={data_count}, key_to_index={key_to_index_count}, index_to_key={index_to_key_count}, deleted={deleted_count}")
+            
+            if not (data_count == key_to_index_count == index_to_key_count == total_points):
+                raise ValueError(f"Inconsistent counts: data={data_count}, key_to_index={key_to_index_count}, index_to_key={index_to_key_count}, total_points={total_points}")
+            
             self.logger.info("Indices are consistent based on counts")
 
     def close(self):
