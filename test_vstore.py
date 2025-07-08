@@ -9,6 +9,11 @@ import uuid
 from parameterized import parameterized
 import lmdb
 import time
+import sys
+
+# Mock nmslib before importing vstore
+sys.modules['nmslib'] = __import__('mock_nmslib')
+
 from vstore import VStore
 
 class TestVStore(unittest.TestCase):
