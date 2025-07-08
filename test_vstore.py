@@ -11,8 +11,7 @@ import lmdb
 import time
 import sys
 
-# Mock nmslib before importing vstore
-sys.modules['nmslib'] = __import__('mock_nmslib')
+# Import nmslib normally (requires fixed-install-nmslib package)
 
 from vstore import VStore
 
