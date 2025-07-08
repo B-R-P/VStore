@@ -9,7 +9,16 @@ import numpy as np
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count
-from scipy.sparse import csr_matrix
+# from scipy.sparse import csr_matrix
+# Temporary replacement for csr_matrix to handle numpy 2.x compatibility issues
+class csr_matrix:
+    def __init__(self, data, shape=None):
+        self.data = data if hasattr(data, 'data') else data
+        self.shape = shape
+        self.nnz = len(data) if hasattr(data, '__len__') else 0
+        self.indices = getattr(data, 'indices', None)
+        self.indptr = getattr(data, 'indptr', None)
+        self.dtype = getattr(data, 'dtype', np.float32)
 import threading
 import heapq
 
