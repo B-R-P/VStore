@@ -422,7 +422,6 @@ class VStore:
         if not filter:
             deleted_keys = set(k.decode('utf-8') if isinstance(k, bytes) else k.tobytes().decode('utf-8') for k, _ in txn.cursor(db=self.db_deleted_ids))
             return set(k.decode('utf-8') if isinstance(k, bytes) else k.tobytes().decode('utf-8') for k, _ in txn.cursor(db=self.db_key_to_index)) - deleted_keys
-
         self._validate_filter(filter)
         if isinstance(filter, dict) and 'op' in filter:
             op = filter['op']
@@ -436,7 +435,6 @@ class VStore:
                 self.logger.debug("No conditions provided, returning empty set")
                 return set()
             return set.intersection(*result_sets) if op == 'AND' else set.union(*result_sets)
-
         matched_keys = set()
         for key, condition in filter.items():
             if isinstance(condition, list) and isinstance(condition[0], (int, float)):
@@ -450,9 +448,15 @@ class VStore:
                     if meta_key > end_key:
                         break
                     try:
-                        _, _, doc_key = meta_key.decode('utf-8').split(':', 2)
+                        composite_key_str = meta_key.decode('utf-8')
+                        last_colon_pos = composite_key_str.rfind(':')
+                        if last_colon_pos == -1:
+                            self.logger.warning(f"Malformed numeric composite key: {composite_key_str}")
+                            continue
+                        doc_key = composite_key_str[last_colon_pos + 1:]
                         matched_keys.add(doc_key)
-                    except (ValueError, IndexError):
+                    except Exception as e:
+                        self.logger.warning(f"Error processing numeric composite key {meta_key}: {e}")
                         pass
                     cursor.next()
                 self.logger.debug(f"Numeric filter {key}:{condition} matched {len(matched_keys)} keys")
@@ -468,9 +472,15 @@ class VStore:
                         if not meta_key.startswith(prefix):
                             break
                         try:
-                            doc_key = meta_key.decode('utf-8').split(':', 2)[2]
+                            composite_key_str = meta_key.decode('utf-8')
+                            last_colon_pos = composite_key_str.rfind(':')
+                            if last_colon_pos == -1:
+                                self.logger.warning(f"Malformed composite key: {composite_key_str}")
+                                continue
+                            doc_key = composite_key_str[last_colon_pos + 1:]
                             value_keys.add(doc_key)
-                        except (ValueError, IndexError):
+                        except Exception as e:
+                            self.logger.warning(f"Error processing composite key {meta_key}: {e}")
                             pass
                         cursor.next()
                     matched_keys.update(value_keys)
@@ -478,6 +488,7 @@ class VStore:
         deleted_keys = set(k.decode('utf-8') if isinstance(k, bytes) else k.tobytes().decode('utf-8') for k, _ in txn.cursor(db=self.db_deleted_ids))
         self.logger.debug(f"Filtered {len(matched_keys)} keys, removed {len(deleted_keys)} deleted keys")
         return matched_keys - deleted_keys
+
 
     def _resize_if_needed(self):
         # Must not be inside a write transaction!
